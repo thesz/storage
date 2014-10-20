@@ -11,11 +11,15 @@ import Control.Concurrent
 import Control.Concurrent.MVar
 import Control.Concurrent.Chan
 
+import Data.Bits
 import qualified Data.ByteString as BS
 
 import qualified Data.Map as Map
 import qualified Data.Set as Set
 import qualified Data.Vector.Unboxed as VU
+import Data.Word
+
+import System.IO
 
 --------------------------------------------------------------------------------
 -- Types for storage.
@@ -39,13 +43,90 @@ data PT a =
         |       PTSplit
                 Int             -- split point: index into arrays.
                 Int             -- split point: bit index (zero is highest bit)
-                ByteArr         -- the byte array of left subtree.
+                ByteVec         -- the byte array of left subtree.
                 (PT a)          -- left subtree.
                 (PT a)          -- right subtree.
         deriving (Eq, Ord, Show)
 
+ptEmpty :: PT a
+ptEmpty = PTNull
+
+ptSingleton :: ByteVec -> a -> PT a
+ptSingleton = PTSingle
+
+findSplit :: Int -> ByteVec -> ByteVec -> (Int, Int)
+findSplit pos a b
+        | pos >= VU.length a = (pos, 0)
+        | pos >= VU.length b = (pos, 0)
+        | aByte == bByte = findSplit (pos+1) a b
+        | otherwise = (pos, splitBit 0 (xor aByte bByte))
+        where
+                aByte = a VU.! pos
+                bByte = b VU.! pos
+                splitBit n byte
+                        | testBit byte (7-n) = n
+                        | otherwise = splitBit (n+1) byte
+
+
+ptInsert :: ByteVec -> a -> PT a -> PT a
+ptInsert key value PTNull = PTSingle key value
+ptInsert key value tree = go 0 tree
+        where
+                go prevSplitPos tree@(PTSingle key' value')
+                        -- check if equal.
+                        | splitIndex >= VU.length key && splitIndex >= VU.length key' = PTSingle key value
+                        -- key is less than key' - equal prefi, but shorter.
+                        | splitIndex >= VU.length key = PTSplit splitIndex 0 key (PTSingle key value) tree
+                        | splitIndex >= VU.length key' = PTSplit splitIndex 0 key' tree (PTSingle key value)
+                        | key VU.! splitIndex < key' VU.! splitIndex =
+                                PTSplit splitIndex splitBit key (PTSingle key value) tree
+                        | otherwise = PTSplit splitIndex splitBit key' tree (PTSingle key value)
+                        where
+                                (splitIndex, splitBit) = findSplit prevSplitPos key key'
 
 
 --------------------------------------------------------------------------------
 -- The storage.
+--
+-- All sizes are Integer's, because native speed of Integer operations for
+-- small integers are about same as for
 
+type Address = Integer
+
+minimalPageSize :: Integer
+minimalPageSize = 256
+
+data Storage = Storage {
+          storageHandle         :: Handle
+        , storageMemSize        :: Address
+        , storagePageSize       :: Address
+        , storageHeaderPages    :: Address
+        , storageHeadersCount   :: Address
+        , storageHeaders        :: MVar [Header]
+        }
+
+data Header = Header {
+          headerSeqIndex        :: Address
+        , headerPrevSeqIndex    :: Address
+        , headerPhysiIndex      :: Address
+        , headerRuns            :: [Run]
+        }
+        deriving Show
+
+-- |Run contains sizes of data stored (count, keys size, data size) and hierarchy of extent sequences.
+data Run = Run Address Address Address [[Extent]]
+        deriving Show
+
+-- |Sequence of pages.
+data Extent = Extent Address Address
+        deriving Show
+
+readHeader :: Handle -> IO Storage
+readHeader handle = do
+        hSeek handle AbsoluteSeek 0
+        error "readHeader!!!"
+
+storageOpen :: FilePath -> IO Storage
+storageOpen fn = do
+        h <- openBinaryFile fn ReadWriteMode
+        readHeader h

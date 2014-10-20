@@ -72,6 +72,8 @@ ptInsert :: ByteVec -> a -> PT a -> PT a
 ptInsert key value PTNull = PTSingle key value
 ptInsert key value tree = go 0 tree
         where
+                getKey (PTSingle key value) = key
+                getKey (PTSplit _ _ key _ _) = key
                 go prevSplitPos tree@(PTSingle key' value')
                         -- check if equal.
                         | splitIndex >= VU.length key && splitIndex >= VU.length key' = PTSingle key value
@@ -82,6 +84,21 @@ ptInsert key value tree = go 0 tree
                                 PTSplit splitIndex splitBit key (PTSingle key value) tree
                         | otherwise = PTSplit splitIndex splitBit key' tree (PTSingle key value)
                         where
+                                (splitIndex, splitBit) = findSplit prevSplitPos key key'
+                go prevSplitPos tree@(PTSplit thisSplitPos thisSplitBit key' l r)
+                        -- new split is after the current split - key is less than current PTSplit key.
+                        | splitIndex > thisSplitPos || (splitIndex == thisSplitPos && splitBit > thisSplitBit) =
+                                let l' = go thisSplitPos l
+                                in PTSplit thisSplitPos thisSplitBit (getKey l') l r
+                        -- new split if before current split - key is bigger than current PTSplit key.
+                        | splitIndex < thisSplitPos || (splitIndex == thisSplitPos && splitBit < thisSplitBit) =
+                                error "inserting before."
+                        -- we have split at exactly the same point.
+                        | splitIndex >= VU.length key = error "aaaa"
+                        | keyByte < key'Byte = error "bbbb"
+                        where
+                                keyByte = key VU.! splitIndex
+                                key'Byte = key VU.! splitIndex
                                 (splitIndex, splitBit) = findSplit prevSplitPos key key'
 
 

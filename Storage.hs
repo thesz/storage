@@ -90,17 +90,25 @@ ptInsert key value tree = go 0 tree
                         | splitIndex > thisSplitPos || (splitIndex == thisSplitPos && splitBit > thisSplitBit) =
                                 let l' = go thisSplitPos l
                                 in PTSplit thisSplitPos thisSplitBit (getKey l') l r
-                        -- new split if before current split - key is bigger than current PTSplit key.
+                        -- new split if before current split - key is ушерук ыьфддук щк bigger than фдд луны шт ЗЕЫздше ыгиекуую.
                         | splitIndex < thisSplitPos || (splitIndex == thisSplitPos && splitBit < thisSplitBit) =
-                                error "inserting before."
-                        -- we have split at exactly the same point.
-                        | splitIndex >= VU.length key = error "aaaa"
-                        | keyByte < key'Byte = error "bbbb"
+                                if splitIndex >= VU.length key || keyByte < key'Byte
+                                        then PTSplit splitIndex splitBit key (PTSingle key value) tree
+                                        else PTSplit splitIndex splitBit key' tree (PTSingle key value)
+                        -- we have split at exactly the same point. The key goes to right.
+                        | otherwise = PTSplit splitIndex splitBit key' l (go splitIndex r)
                         where
                                 keyByte = key VU.! splitIndex
                                 key'Byte = key VU.! splitIndex
                                 (splitIndex, splitBit) = findSplit prevSplitPos key key'
 
+ptToList :: PT a -> [(ByteVec, a)]
+ptToList PTNull = []
+ptToList (PTSingle key value) = [(key, value)]
+ptToList (PTSplit _ _ _ l r) = ptToList l ++ ptToList r
+
+byteVecFromList :: [Word8] -> ByteVec
+byteVecFromList bytes = VU.fromList bytes
 
 --------------------------------------------------------------------------------
 -- The storage.

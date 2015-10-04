@@ -12,7 +12,6 @@ import Control.Concurrent.MVar
 import Control.Concurrent.Chan
 
 import Data.Bits
-import qualified Data.ByteString as BS
 
 import qualified Data.Map as Map
 import qualified Data.Set as Set
@@ -31,28 +30,32 @@ type Value = ByteVec
 
 --------------------------------------------------------------------------------
 -- Patricia tree for fast lookup and priority tree construction.
--- 
+--
 
-data PT a =
+data PTValue = Empty | Delete | DeletePrefix | Data Value
+
+data PT =
         -- trivial empty constructor.
                 PTNull
         -- also trivial singleton constructor.
-        |       PTSingle ByteVec a
+        |       PTSingle Key PTValue
         -- split constructor.
         -- left and right subtrees are equal up to point of split, recorded in first two arguments.
         |       PTSplit
-                Int             -- split point: index into arrays.
-                Int             -- split point: bit index (zero is highest bit)
-                ByteVec         -- the byte array of left subtree.
-                (PT a)          -- left subtree.
-                (PT a)          -- right subtree.
+                !Int            -- split point: index into arrays.
+                !Int            -- split point: bit index (zero is highest bit)
+                !ByteVec        -- the byte array of left subtree.
+                !PT             -- left subtree.
+                !PT             -- right subtree.
         deriving (Eq, Ord, Show)
 
-ptEmpty :: PT a
+ptEmpty :: PT
 ptEmpty = PTNull
 
-ptSingleton :: ByteVec -> a -> PT a
-ptSingleton = PTSingle
+ptSingleton :: Key -> Value -> PT
+ptSingleton key value
+        | VU.null value = PTSingle key Empty
+        | otherwise = PTSingle key (Data value)
 
 findSplit :: Int -> ByteVec -> ByteVec -> (Int, Int)
 findSplit pos a b
@@ -68,7 +71,7 @@ findSplit pos a b
                         | otherwise = splitBit (n+1) byte
 
 
-ptInsert :: ByteVec -> a -> PT a -> PT a
+ptInsert :: ByteVec -> PTValue -> PT -> PT
 ptInsert key value PTNull = PTSingle key value
 ptInsert key value tree = go 0 tree
         where
@@ -138,6 +141,14 @@ data Header = Header {
         }
         deriving Show
 
+-- |Configuration for newly created storage.
+data StorageConfig = StorageConfig {
+        -- |Must be power of two.
+          storageConfigPageSize         :: Address
+        -- |
+        , storageConfigHeaders          :: Int
+        }
+
 -- |Run contains sizes of data stored (count, keys size, data size) and hierarchy of extent sequences.
 data Run = Run Address Address Address [[Extent]]
         deriving Show
@@ -155,3 +166,8 @@ storageOpen :: FilePath -> IO Storage
 storageOpen fn = do
         h <- openBinaryFile fn ReadWriteMode
         readHeader h
+
+storageCreateWithConfig :: StorageConfig -> FilePath -> IO Storage
+storageCreateWithConfig config path = do
+        h <- 
+        error "AAAAAAAAAA"

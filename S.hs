@@ -276,7 +276,7 @@ encodeString :: String -> Builder
 encodeString = mconcat . map (encodeWideInt . fromIntegral . fromEnum)
 
 encodeByteStringWithLength :: Int -> WideInt -> BS.ByteString -> Builder
-encodeByteStringWithLength shift add bs = mconcat [encodeWideInt (shiftL (fromIntegral $ BS.length bs) shift + add, lazyByteString bs]
+encodeByteStringWithLength shift add bs = mconcat [encodeWideInt (shiftL (fromIntegral $ BS.length bs) shift + add), lazyByteString bs]
 
 -------------------------------------------------------------------------------
 -- Internal API.
@@ -473,41 +473,48 @@ mergeProcess lsm memPart@(memCnt, memKS, memDS, map) newLevels oldLevels = do
 		merge lsm writers prioQ = case Map.minViewWithKey prioQ of
 			Just ((key,(n, mbVal, iter)), prioQ') -> do
 				(writers', lsm') <- if (not mergeNoDeletes || Maybe.isJust mbVal)
-					then writeWriters key mbVal writers
+					then writeWriters lsm key mbVal writers
 					else return (writers, lsm)
 				prioQ' <- putIter n iter prioQ
 				merge lsm' writers' prioQ'
 			Nothing -> finalizeMerge lsm writers
 		finalizeMerge lsm writers = error "finalize merge!"
-		writeWriters key mbVal writers = do
-			writers' <- go False 
-			error "write writers!"
+		writeWriters :: LSM -> BS.ByteString -> Maybe BS.ByteString -> [Write] -> IO ([Write], LSM)
+		writeWriters lsm key mbVal (wr:wrs) = do
+			writers' <- go False mbVal wr wrs
+			return (writers', error "writers lsm!")
 			where
 				keyEnc = encodeByteStringWithLength 0 0 key
 				writeIndexSeq mbValue wr = do
 					let	value = Maybe.fromMaybe (error "nothing for index seq?") mbValue
-							add = mconcat [keyEnc, encodeByteStringWithLength 0 0 value]
+						add = mconcat [keyEnc, encodeByteStringWithLength 0 0 value]
 					return $ wr {
 						  wrBuffer = mappend (wrBuffer wr) add
 						}
 				writeKeyDataSeq mbValue wr = do
-					let	specialFlag = Maybe.fromMaybe True $ fmap BS.null value'
+					let	specialFlag = Maybe.fromMaybe True $ fmap BS.null mbValue
 						deleteFlag = not mergeNoDeletes && Maybe.isNothing mbValue
 						addToLen = (if specialFlag then 1 else 0) + (if deleteFlag then 2 else 0)
 						shift = if mergeNoDeletes then 1 else 2
-						keyEnc = encodeByteStringWithLength shift addToLen
-						dataEnc = Maybe.fromMaybe BS.empty $ fmap (v -> if BS.null v then BS.empty else encodeByteStringWithLength 0 0 v)
+						keyEnc = encodeByteStringWithLength shift addToLen key
+						dataEnc = Maybe.fromMaybe mempty $ fmap (\v -> if BS.null v then mempty else encodeByteStringWithLength 0 0 v) mbVal
 					return $ wr {
 						  wrBuffer = mconcat [wrBuffer wr, keyEnc, dataEnc]
 						, wrKeysWritten = let kw' = wrKeysWritten wr + 1 in
-							if kw' >= branching then kw' - branching e;se kw'
+							if kw' >= branching then kw' - branching else kw'
 						}
-				go indexWr mbValue wr []
-					| indexWr = writeIndexSeq mbValue wr
-					| otherwise = writeKeyDataSeq mbValue wr
-				go indexWr mbValue wr (iwr:iwrs)
-					| indexWr = do
-						let	nextData = Just $ encodePos wr
+				go indexWr mbValue wr [] = do
+					wr' <- (if indexWr then writeIndexSeq else writeKeyDataSeq)
+						mbValue wr
+					return [wr']
+				go indexWr mbValue wr (iwr:iwrs) = do
+					let	nextData = Just $ encodePos wr
+					wrs <- go True nextData iwr iwrs
+					wr <- if indexWr
+						then writeIndexSeq mbValue wr
+						else writeKeyDataSeq mbValue wr
+					return $ wr : wrs
+		encodePos wr = error "encode pos!"
 		putIter n iter prioQ = do
 			readResult <- readIterValue lsm iter
 			case readResult of

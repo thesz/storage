@@ -475,7 +475,7 @@ mergeProcess lsm memPart@(memCnt, memKS, memDS, map) newLevels oldLevels = do
 				(writers', lsm') <- if (not mergeNoDeletes || Maybe.isJust mbVal)
 					then writeWriters lsm key mbVal writers
 					else return (writers, lsm)
-				prioQ' <- putIter n iter prioQ
+				prioQ' <- putIter n iter prioQ'
 				merge lsm' writers' prioQ'
 			Nothing -> finalizeMerge lsm writers
 		finalizeMerge lsm writers = error "finalize merge!"
@@ -508,6 +508,7 @@ mergeProcess lsm memPart@(memCnt, memKS, memDS, map) newLevels oldLevels = do
 						mbValue wr
 					return [wr']
 				go indexWr mbValue wr (iwr:iwrs) = do
+					putStrLn $ "go: "++show (indexWr, mbValue, wr, (iwr:iwrs))
 					let	nextData = Just $ encodePos wr
 					wrs <- go True nextData iwr iwrs
 					wr <- if indexWr

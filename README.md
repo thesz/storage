@@ -2,7 +2,7 @@ Storage engine, LSM-style
 =========================
 
 
-Generral information
+General information
 --------------------
 
 This repository contains storage engine that implements persistent key-value storage

@@ -45,6 +45,9 @@ defaultPageBits = 13
 defaultMemoryPartSize :: WideInt
 defaultMemoryPartSize = 256*1024
 
+defaultFlushSize :: WideInt
+defaultFlushSize = 8*1024*1024
+
 minSizeIncrement :: WideInt
 minSizeIncrement = defaultMemoryPartSize*2
 
@@ -53,7 +56,7 @@ minSizeIncrement = defaultMemoryPartSize*2
 
 type WideInt = Int64
 
-type BlockCounts = Map.Map WideInt WideInt
+type BlockCounts = Map.Map WideInt (WideInt, LSMBlock)
 
 data LSMInfo = LSMInfo {
 	  lsmiHeader		:: LSMHeader
@@ -66,24 +69,24 @@ emptyLSMInfo pageBits statesCount = LSMInfo h (map emptyLSMState [0 .. lsmhState
 	where
 		h = defaultLSMHeader pageBits statesCount
 
-_checkLength :: WideInt -> WideInt -> WideInt
-_checkLength a b
-	| a == b = a
+_checkLength :: (WideInt, LSMBlock) -> (WideInt, LSMBlock) -> (WideInt, LSMBlock)
+_checkLength (a,ablk) (b, bblk)
+	| lsmbSize ablk == lsmbSize bblk = (a, ablk)
 	| otherwise = error $ "different lengths for same address: a "++show a++" and b "++show b
 
-_allAddrs :: (b -> Map.Map WideInt WideInt) -> (a -> [b]) -> a -> Map.Map WideInt WideInt
+_allAddrs :: (b -> BlockCounts) -> (a -> [b]) -> a -> BlockCounts
 _allAddrs g f = Map.unionsWith _checkLength . map g . f
 
-lsmInfoAddrs :: LSMInfo -> Map.Map WideInt WideInt
-lsmInfoAddrs = _allAddrs lsmStateAddrs lsmiStates
+lsmInfoCounts :: LSMInfo -> BlockCounts
+lsmInfoCounts = _allAddrs lsmStateCounts lsmiStates
 
-lsmStateAddrs :: LSMState -> Map.Map WideInt WideInt
-lsmStateAddrs = _allAddrs lsmLevelAddrs lsmsLevels
+lsmStateCounts :: LSMState -> BlockCounts
+lsmStateCounts = _allAddrs lsmLevelCounts lsmsLevels
 
-lsmLevelAddrs :: LSMLevel -> Map.Map WideInt WideInt
-lsmLevelAddrs = _allAddrs lsmRunAddrs lsmlRuns
+lsmLevelCounts :: LSMLevel -> BlockCounts
+lsmLevelCounts = _allAddrs lsmRunCounts lsmlRuns
 
-lsmRunAddrs = _allAddrs (\(LSMBlock a l) -> Map.singleton a l) lsmrBlocks
+lsmRunCounts = _allAddrs (\b@(LSMBlock a l) -> Map.singleton a (1,b)) lsmrBlocks
 
 lsmInfoPageSize :: LSMInfo -> WideInt
 lsmInfoPageSize = lsmhPageSize . lsmiHeader
@@ -146,7 +149,24 @@ data LSMLevel = LSMLevel {
 	}
 	deriving (Eq, Ord, Show)
 
-data LSMRun = LSMRun { lsmrBlocks :: [LSMBlock]}
+data LSMRunType = Sequential
+	deriving (Eq, Ord, Show, Enum)
+
+encodeLSMRunType :: LSMRunType -> Builder
+encodeLSMRunType Sequential = encodeWideInt 0
+
+decodeLSMRunType :: BS.ByteString -> (LSMRunType, BS.ByteString)
+decodeLSMRunType bs = (ty, bs')
+	where
+		ty = case n of
+			0 -> Sequential
+			_ -> error $ "unknown run type code "++show n
+		(n,bs') = decodeWideInt bs
+
+data LSMRun = LSMRun {
+	  lsmrType	:: LSMRunType
+	, lsmrBlocks	:: [LSMBlock]
+	}
 	deriving (Eq, Ord, Show)
 
 data LSMBlock = LSMBlock {
@@ -166,6 +186,7 @@ data LSM = LSM {
 	, lsmHandle		:: Handle
 	, lsmBranching		:: WideInt
 	, lsmPagePreread	:: WideInt
+	, lsmFlushThreshold	:: WideInt
 	}
 
 findRecentLevels :: LSM -> [LSMLevel]
@@ -283,24 +304,34 @@ encodeByteStringWithLength shift add bs = mconcat [encodeWideInt (shiftL (fromIn
 
 changeCounts :: WideInt -> BlockCounts -> BlockCounts -> BlockCounts
 changeCounts change addrs blockCounts = Map.mergeWithKey
-	(\a count change -> let r = count+change in if r <= 0 then Nothing else Just r)
+	(\a (count, b) (change,b') -> let r = count+change in if r <= 0 then Nothing else Just (r,b))
 	id
 	(if change > 0 then id else const Map.empty)
-	blockCounts (Map.map (*change) addrs)
+	blockCounts (Map.map (\(c,b) -> (c*change, b)) addrs)
 
 mkLSM :: LSMInfo -> LSMCmdChan -> Handle -> WideInt -> LSM
 mkLSM info chan handle filePages = let lsm = LSM {
 		  lsmInfo		= info
 		, lsmCmdChan		= chan
-		, lsmBlockCounts	= changeCounts 1 (lsmInfoAddrs info) Map.empty
-		, lsmFreeBlocks		= error "free blocks!"
+		, lsmBlockCounts	= counts
+		, lsmFreeBlocks		= freeBlocks 0 $ map snd $ Map.elems counts
 		, lsmHandle		= handle
 		, lsmPhysPagesStart	= lsmhStateRecPages (lsmHeader lsm) * fromIntegral (length $ lsmiStates $ lsmInfo lsm) + 1
 		, lsmBranching		= 1024
 		, lsmPagePreread	= 4
+		, lsmFlushThreshold	= defaultFlushSize
 		}
 	in lsm
 	where
+		counts = lsmInfoCounts info
+		freeBlocks lastFree [] = []
+		freeBlocks lastFree (b:bs)
+			| lastFree < lsmbAddr b = LSMBlock lastFree size
+				: rest
+			| otherwise = rest
+			where
+				rest = freeBlocks (lsmbAddr b + lsmbSize b) bs
+				size = lsmbAddr b - lastFree
 		logicalPages = max 0 (filePages - lsmInfoHeaderPages info)
 
 lsmPutBuilderAtPhysPage :: LSM -> WideInt -> WideInt -> Builder -> IO Builder
@@ -363,7 +394,7 @@ writeState flush lsm state = do
 			, encodeWideInt $ lsmlDataSize level
 			, encList encRun $ lsmlRuns level
 			]
-		encRun run = encList encBlock $ lsmrBlocks run
+		encRun (LSMRun ty blocks) = mconcat [encodeLSMRunType ty, encList encBlock blocks]
 		encBlock (LSMBlock a size) = mconcat [encodeWideInt a, encodeWideInt size]
 
 writeStates :: LSM -> IO ()
@@ -446,18 +477,60 @@ readIterValue lsm (IDisk hasDels buf blocks)
 				n = min size 4
 
 -- |Writer to disk or memory.
-data Write = Write {
+data Writer = Writer {
 	  wrAllocPagesCount	:: WideInt	-- how many pages allocate to a next block. calculated in advance and does not change.
 	, wrAbsPageIndex	:: WideInt	-- index of page as if they all are continuous.
-	, wrPageOffset		:: WideInt	-- offset within current page.
 	, wrKeysWritten		:: WideInt	-- number of keys written (data may be missing or not data (reference)).
+	, wrKeysSize		:: WideInt	-- size of keys written.
+	, wrDataSize		:: WideInt	-- size of data written
 	, wrBlocks		:: [LSMBlock]	-- blocks allocated for a writer. writer fills the last one.
 	, wrBuffer		:: Builder	-- buffer of data to write.
 	}
 	deriving Show
 
+writerBytesInBuffer :: Writer -> WideInt
+writerBytesInBuffer wr = fromIntegral $ builderLength $ wrBuffer wr
+
+writerPagesInBuffer :: LSM -> Writer -> WideInt
+writerPagesInBuffer lsm wr = lsmPagesBytes lsm $ writerBytesInBuffer wr
+
+writerPagesRemains :: Writer -> WideInt
+writerPagesRemains wr = sum (map lsmbSize $ wrBlocks wr) - wrAbsPageIndex wr
+
+writerToRun :: Writer -> LSMRun
+writerToRun wr = LSMRun {
+	  lsmrType	= Sequential
+	, lsmrBlocks	= wrBlocks wr
+	}
+
+makeLevel :: [LSMRun] -> Writer -> LSMLevel
+makeLevel runs kdWriter = LSMLevel {
+	  lsmlRuns		= runs
+	, lsmlPairsCount	= wrKeysWritten kdWriter
+	, lsmlKeysSize		= wrKeysSize kdWriter
+	, lsmlDataSize		= wrDataSize kdWriter
+	}
+
+allocateBlock :: WideInt -> LSM -> (LSM, LSMBlock)
+allocateBlock size lsm
+	| null goodBlocks = error "null goodBlocks!"
+	| otherwise = (withBestBlock, allocated)
+	where
+		freeBlocks = lsmFreeBlocks lsm
+		goodBlocks = filter ((>= size) . lsmbSize) freeBlocks
+		bestBlock = snd $ minimum $ map (\b -> (lsmbSize b - size, b)) goodBlocks
+		allocated = bestBlock { lsmbSize = size }
+		toChange = bestBlock { lsmbAddr = lsmbAddr bestBlock + size, lsmbSize = lsmbSize bestBlock - size }
+		withBestBlock
+			| lsmbSize bestBlock > size = lsm {
+				  lsmFreeBlocks = map (\b -> if lsmbAddr b == lsmbAddr allocated then toChange else b) $ lsmFreeBlocks lsm
+				}
+			| otherwise = lsm {
+				  lsmFreeBlocks = filter (\b -> lsmbAddr b /= lsmbAddr allocated) $ lsmFreeBlocks lsm
+				}
+
 mergeProcess :: LSM -> (WideInt, WideInt, WideInt, Map.Map BS.ByteString (Maybe BS.ByteString)) -> [LSMLevel] -> [LSMLevel] -> IO (LSM, LSMLevel, [LSMLevel])
-mergeProcess lsm memPart@(memCnt, memKS, memDS, map) newLevels oldLevels = do
+mergeProcess lsm memPart@(memCnt, memKS, memDS, memMap) newLevels oldLevels = do
 	putStrLn $ "mergeProcess:     mem: "++show memPart
 	putStrLn $ "                  new: "++show newLevels
 	putStrLn $ "                  old: "++show newLevels
@@ -468,6 +541,8 @@ mergeProcess lsm memPart@(memCnt, memKS, memDS, map) newLevels oldLevels = do
 	putStrLn $ "starting priority queue."
 	prioQ <- foldM readFirstValue Map.empty resultIters
 	(newLevel, lsm) <- merge lsm writers prioQ
+	putStrLn $ "resulting free blocks: "++show (lsmFreeBlocks lsm)
+	putStrLn $ "resulting block counts: "++show (lsmBlockCounts lsm)
 	return $ error "aaa!!!"
 	where
 		merge lsm writers prioQ = case Map.minViewWithKey prioQ of
@@ -478,11 +553,71 @@ mergeProcess lsm memPart@(memCnt, memKS, memDS, map) newLevels oldLevels = do
 				prioQ' <- putIter n iter prioQ'
 				merge lsm' writers' prioQ'
 			Nothing -> finalizeMerge lsm writers
-		finalizeMerge lsm writers = error "finalize merge!"
-		writeWriters :: LSM -> BS.ByteString -> Maybe BS.ByteString -> [Write] -> IO ([Write], LSM)
+		finalizeMerge lsm writers = do
+			putStrLn "Finalizing merge."
+			(finalWriters, lsm) <- foldM (\(ws, lsm) wr -> finalizeWriter wr lsm >>= \(wr, lsm) -> return (ws++wr, lsm)) ([], lsm)
+				writers
+			putStrLn $ "Finalized writers:"
+			forM_ finalWriters $ putStrLn . ("    writer: "++) . show
+			let	runs = map writerToRun finalWriters
+				kdWriter = last finalWriters
+				level = makeLevel runs kdWriter
+			return (level, lsm)
+		finalizeWriter wr' lsm = do
+			let	wr = wr' { wrBuffer = mappend (wrBuffer wr') (writeByte 0) }	-- sequential runs are like these. end with key len 0.
+				(lsm', wr'') = allocateForWrite True wr' lsm
+			putStrLn $ "Finalized writer "++show wr++"\n     wr'': "++show wr''
+			(lsm'', wr''') <- actualWriterFlush True lsm' wr''
+			return ([wr'''], lsm')
+		allocateForWrite lastBlock writer lsm
+			-- not enough space in allocated blocks.
+			| pagesToAllocate > 0 = (lsmAllocated, writerAllocated)
+			-- we have enough space in blocks we already allocated.
+			| otherwise = (lsm, writer)
+			where
+				lsmAllocated = lsm {
+					  lsmBlockCounts = Map.insert maxUsedPage (1, ourBlock) $ lsmBlockCounts lsm
+					}
+				writerAllocated = writer {
+					  wrBlocks = wrBlocks writer ++ [ourBlock]
+					}
+				ourBlock = LSMBlock { lsmbAddr = maxUsedPage, lsmbSize = pagesToAllocate }
+				usedBlocks = lsmBlockCounts lsm
+				maxUsedPage = maybe 0 (\((_c,b),_) -> lsmbAddr b + lsmbSize b) $ Map.maxView usedBlocks
+				filledPages = wrAbsPageIndex writer
+				allocatedPages = sum $ map lsmbSize $ wrBlocks writer
+				pagesUnwritten = allocatedPages - filledPages
+				pagesDiff = pagesNeedToBeWritten - pagesUnwritten
+				pagesToAllocate
+					| lastBlock = pagesDiff
+					| otherwise = max (wrAllocPagesCount writer) pagesDiff
+				bytesNeedToBeWritten = fromIntegral (builderLength $ wrBuffer writer)
+				pagesNeedToBeWritten = lsmBytesPages lsm bytesNeedToBeWritten
+		flushWriter :: Bool -> (LSM, [Writer]) -> Writer -> IO (LSM, [Writer])
+		flushWriter final (lsm, ws) writer = do
+			putStrLn $ "flushing "++show (final, writer)
+			(lsm', writer') <- if flush
+				then actualWriterFlush final lsm writer
+				else return (lsm, writer)
+			return (lsm', ws++[writer'])
+			where
+				flush = final || fromIntegral (builderLength buf) > lsmFlushThreshold lsm
+				buf = wrBuffer writer
+		actualWriterFlush final lsm writer
+			| overflow && pagesRemain > 0 = do
+				error "write before alloc."
+			| overflow = do
+				error $ "allocate and call again, pagesRemain "++show pagesRemain++"\nwriter "++show writer
+			| otherwise = return (lsm, writer)
+			where
+				overflow = bufPages > pagesRemain || final
+				bufPages = writerPagesInBuffer lsm writer
+				pagesRemain = writerPagesRemains writer
+		writeWriters :: LSM -> BS.ByteString -> Maybe BS.ByteString -> [Writer] -> IO ([Writer], LSM)
 		writeWriters lsm key mbVal (wr:wrs) = do
 			writers' <- go False mbVal wr wrs
-			return (writers', error "writers lsm!")
+			(lsm', writers'') <- foldM (flushWriter False) (lsm, []) writers'
+			return (writers'', lsm')
 			where
 				keyEnc = encodeByteStringWithLength 0 0 key
 				writeIndexSeq mbValue wr = do
@@ -497,11 +632,14 @@ mergeProcess lsm memPart@(memCnt, memKS, memDS, map) newLevels oldLevels = do
 						addToLen = (if specialFlag then 1 else 0) + (if deleteFlag then 2 else 0)
 						shift = if mergeNoDeletes then 1 else 2
 						keyEnc = encodeByteStringWithLength shift addToLen key
+						dataLen = fromIntegral $ maybe 0 BS.length mbValue
 						dataEnc = Maybe.fromMaybe mempty $ fmap (\v -> if BS.null v then mempty else encodeByteStringWithLength 0 0 v) mbVal
 					return $ wr {
 						  wrBuffer = mconcat [wrBuffer wr, keyEnc, dataEnc]
 						, wrKeysWritten = let kw' = wrKeysWritten wr + 1 in
 							if kw' >= branching then kw' - branching else kw'
+						, wrKeysSize = BS.length key + wrKeysSize wr
+						, wrDataSize = dataLen + wrDataSize wr
 						}
 				go indexWr mbValue wr [] = do
 					wr' <- (if indexWr then writeIndexSeq else writeKeyDataSeq)
@@ -545,11 +683,12 @@ mergeProcess lsm memPart@(memCnt, memKS, memDS, map) newLevels oldLevels = do
 			| otherwise = writer : makeWriters True cntUp allDataSizeUp
 			where
 				allocPagesCount = div (inPages allDataSize + 7) 8
-				writer = Write {
+				writer = Writer {
 					  wrAllocPagesCount	= allocPagesCount
 					, wrAbsPageIndex	= 0
-					, wrPageOffset		= 0
 					, wrKeysWritten		= 0
+					, wrKeysSize		= 0
+					, wrDataSize		= 0
 					, wrBlocks		= []
 					, wrBuffer		= mempty
 					}
@@ -563,7 +702,7 @@ mergeProcess lsm memPart@(memCnt, memKS, memDS, map) newLevels oldLevels = do
 			| otherwise = (afterNewIters, afterNewRest++oldLevels)
 			where
 				(afterNewIters, afterNewRest) =
-					computeMerge (null oldLevels) forceMergeAllNew (memCnt, (memKS+memDS), [IMem map]) newLevels
+					computeMerge (null oldLevels) forceMergeAllNew (memCnt, (memKS+memDS), [IMem memMap]) newLevels
 		computeMerge lastLevelLast forceAdd iters [] = (iters, [])
 		computeMerge lastLevelLast forceAdd iters@(cnt, size, itersRev) rest@(level:levels)
 			| add = computeMerge lastLevelLast forceAdd (cnt+lcnt, size+lsize, IDisk hasDeletes mempty lblocks : itersRev) levels
@@ -581,16 +720,16 @@ acquireReleaseBlocks lsm acquire release = rlsm
 	where
 		alsm = List.foldl' acq lsm acquire
 		rlsm = List.foldl' rel alsm release
-		acq lsm (LSMBlock a s) = lsm'
+		acq lsm b@(LSMBlock a s) = lsm'
 			where
 				lsm' = lsm {
-					  lsmBlockCounts = Map.insertWith (+) a 1 $ lsmBlockCounts lsm
+					  lsmBlockCounts = Map.insertWith (\(c1,b') (c2,_) -> (c1+c2, b)) a (1,b) $ lsmBlockCounts lsm
 					}
 		rel lsm b@(LSMBlock a s)
-			| Just n <- old, n > 1 = lsm { lsmBlockCounts = counts }
-			| Just n <- old, n <= 1 = lsm { lsmBlockCounts = Map.delete a counts, lsmFreeBlocks = mergeFree (lsmFreeBlocks lsm) [b]}
+			| Just (n,b') <- old, n > 1 = lsm { lsmBlockCounts = counts }
+			| Just (n,b') <- old, n <= 1 = lsm { lsmBlockCounts = Map.delete a counts, lsmFreeBlocks = mergeFree (lsmFreeBlocks lsm) [b]}
 			where
-				(old, counts) = Map.insertLookupWithKey (\_ o c -> o+c) a (-1) $ lsmBlockCounts lsm
+				(old, counts) = Map.insertLookupWithKey (\_ (o,b1) (c,_) -> (o+c,b1)) a (-1, b) $ lsmBlockCounts lsm
 
 acquireReleaseLevels :: LSM -> [LSMLevel] -> [LSMLevel] -> LSM
 acquireReleaseLevels lsm acquire release = acquireReleaseBlocks lsm (lsmLevelsBlocks acquire) (lsmLevelsBlocks release)
@@ -644,7 +783,7 @@ lsmWorker lsm = do
 			let	blocksToRelease = Map.unions $ map (\b -> Map.singleton (lsmbAddr b) (1, lsmbSize b)) $
 					concatMap lsmrBlocks $ concatMap lsmlRuns levels
 				blocksRemain = Map.mergeWithKey
-					(\_a cnt (dec, size) -> let r = cnt - dec in if r < 1 then Nothing else Just r)
+					(\_a (cnt, b) (dec, size) -> let r = cnt - dec in if r < 1 then Nothing else Just (r, b))
 					id
 					(error . ("blocks to free that are not in alloced blocks: " ++) . show)
 					(lsmBlockCounts lsm) blocksToRelease

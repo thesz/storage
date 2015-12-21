@@ -1,4 +1,5 @@
 {-# LANGUAGE ForeignFunctionInterface, PatternGuards #-}
+{-# LANGUAGE GeneralizedNewtypeDeriving #-}
 {-# OPTIONS_GHC -fno-warn-tabs #-}
 
 module S where
@@ -15,6 +16,8 @@ import Data.Bits
 
 import qualified Data.ByteString.Lazy as BS
 import qualified Data.ByteString.Builder as BSB
+
+import Data.Either (isRight)
 
 import Data.Int
 
@@ -62,7 +65,11 @@ minSizeIncrement = defaultMemoryPartSize*2
 -------------------------------------------------------------------------------
 -- Data types.
 
-type WideInt = Int64
+newtype WideInt = WideInt Int64
+	deriving (Eq, Ord, Num, Integral, Enum, Real, Show, Bits, PrintfArg, FiniteBits)
+
+bystrLen :: BS.ByteString -> WideInt
+bystrLen = fromIntegral . BS.length
 
 type BlockCounts = Map.Map WideInt (WideInt, LSMBlock)
 
@@ -283,7 +290,7 @@ decodeWideInt bs = case split of
 	where
 		split = BS.uncons bs
 
-decodeNeedBytes :: BS.ByteString -> Int
+decodeNeedBytes :: BS.ByteString -> WideInt
 decodeNeedBytes bs
 	| BS.null bs = 1
 	| n < encode1ByteLim = 1
@@ -298,14 +305,14 @@ decodeNeedBytes bs
 		eightN = threeN+8-3
 		n = fromIntegral $ BS.head bs
 
-decodeNeedBuilderBytes :: Builder -> Int
+decodeNeedBuilderBytes :: Builder -> WideInt
 decodeNeedBuilderBytes bld = decodeNeedBytes $ toLazyByteString bld
 
 encodeString :: String -> Builder
 encodeString = mconcat . map (encodeWideInt . fromIntegral . fromEnum)
 
-encodeByteStringWithLength :: Int -> WideInt -> BS.ByteString -> Builder
-encodeByteStringWithLength shift add bs = mconcat [encodeWideInt (shiftL (fromIntegral $ BS.length bs) shift + add), lazyByteString bs]
+encodeLength :: Int ->WideInt -> WideInt -> Builder
+encodeLength shift add len = encodeWideInt (shiftL len shift + add)
 
 -------------------------------------------------------------------------------
 -- Internal API.
@@ -419,7 +426,7 @@ writeStates lsm = do
 data Command =
 		CopyLevels	(MVar [LSMLevel])
 	|	Close	(MVar ())
-	|	Release	[LSMLevel]
+	|	Release	[LSMBlock]
 	|	Commit	Isolation	WideInt	WideInt	WideInt
 			(Map.Map BS.ByteString (Maybe BS.ByteString)) [LSMLevel] (MVar ())
 	|	ReadIter	DiskIter	(MVar DiskIter)
@@ -431,8 +438,10 @@ internalCopyLevels chan = do
 	takeMVar result
 
 internalReleaseLevels :: LSMCmdChan -> [LSMLevel] -> IO ()
-internalReleaseLevels chan levels = do
-	writeChan chan $ Release levels
+internalReleaseLevels chan levels = internalReleaseBlocks chan $ lsmLevelsBlocks levels
+
+internalReleaseBlocks :: LSMCmdChan -> [LSMBlock] -> IO ()
+internalReleaseBlocks chan blocks = writeChan chan $ Release blocks
 
 -------------------------------------------------------------------------------
 -- Transaction types.
@@ -465,11 +474,13 @@ withTxn opname (LSMTxn txnRef) act = do
 		Nothing -> internal $ "closed transaction in "++opname
 
 data DiskIter = DiskIter {
-	  diHasDeletes
+	  diDone		:: Bool
+	, diHasDeletes
 	, diHasSpecial		:: Bool
 	, diPageOffset		:: WideInt
+	, diPageIndex		:: WideInt
 	, diPagesPreread	:: WideInt
-	, diBuffer		:: Builder
+	, diBuffer		:: BS.ByteString
 	, diBlocks		:: [LSMBlock]
 	, diKVs			:: [(BS.ByteString, Maybe BS.ByteString)]
 	}
@@ -482,27 +493,33 @@ data Iter =
 	|	IDisk	DiskIter
 	deriving Show
 
+findPageBlockAbs :: WideInt -> [LSMBlock] -> LSMBlock
+findPageBlockAbs pageIndex blocks = find pageIndex blocks
+	where
+		find _ [] = internal "pageIndex out of blocks range"
+		find i (b:bs)
+			| i < lsmbSize b = LSMBlock (lsmbAddr b + i) (lsmbSize b - i)
+			| otherwise = find (i-lsmbSize b) bs
+
 readDiskIterValue :: LSM -> DiskIter -> IO (Maybe ((BS.ByteString, Maybe BS.ByteString), DiskIter))
-readDiskIterValue lsm (DiskIter hasDels hasSpecl ofs pagesPre buffer blocks (kv:kvs)) =
-	return $ Just (kv,DiskIter hasDels hasSpecl ofs pagesPre buffer blocks kvs)
-readDiskIterValue lsm (DiskIter hasDels hasSpecl ofs pagesPre buffer blocks [])
-	| builderNull buffer && null blocks = return Nothing
+readDiskIterValue lsm (DiskIter done hasDels hasSpecl ofs index pagesPre buffer blocks (kv:kvs)) =
+	return $ Just (kv,DiskIter done hasDels hasSpecl ofs index pagesPre buffer blocks kvs)
+readDiskIterValue lsm (DiskIter done hasDels hasSpecl ofs index pagesPre buffer blocks [])
+	| done = return Nothing
 	| canReadLength = do
 		ned "length read!"
 	| otherwise = do
-		(buf', blocks') <- rdPart buffer blocks
-		readDiskIterValue lsm (DiskIter hasDels hasSpecl 0 pagesPre buf' blocks' [])
+		(buf', index') <- rdPart buffer
+		readDiskIterValue lsm (DiskIter done hasDels hasSpecl 0 index pagesPre buf' blocks [])
 	where
-		canReadLength = builderLength buffer >= decodeNeedBuilderBytes buffer
-		rdPart buf (LSMBlock a size : blocks) = do
+		canReadLength = fromIntegral (BS.length buffer) >= decodeNeedBytes buffer
+		LSMBlock a size = findPageBlockAbs index blocks
+		rdPart buf = do
 			incr <- readLogicalPages lsm a n
-			return (mappend buf (lazyByteString incr), blocks')
+			return (BS.append buf incr, index+n)
 			where
-				blocks'
-					| size' > 0 = LSMBlock (a+n) size' : blocks
-					| otherwise = blocks
 				size' = size-n
-				n = min size 4
+				n = min size pagesPre
 
 readIterValue :: LSM -> Iter -> IO (Maybe ((BS.ByteString, Maybe BS.ByteString), Iter))
 readIterValue lsm (IMem map) = return $ (fmap $ \(kv,map) -> (kv,IMem map)) $ Map.minViewWithKey map
@@ -672,10 +689,10 @@ mergeProcess lsm memPart@(memCnt, memKS, memDS, memMap) newLevels oldLevels = do
 			(lsm', writers'') <- foldM (flushWriter False) (lsm, []) writers'
 			return (writers'', lsm')
 			where
-				keyEnc = encodeByteStringWithLength 0 0 key
+				keyLen = fromIntegral $ BS.length key
 				writeIndexSeq mbValue wr = do
 					let	value = Maybe.fromMaybe (error "nothing for index seq?") mbValue
-						add = mconcat [keyEnc, encodeByteStringWithLength 0 0 value]
+						add = mconcat [encodeLength 0 0 keyLen, encodeLength 0 0 (fromIntegral $ BS.length value), lazyByteString key, lazyByteString value]
 					return $ wr {
 						  wrBuffer = mappend (wrBuffer wr) add
 						}
@@ -684,14 +701,15 @@ mergeProcess lsm memPart@(memCnt, memKS, memDS, memMap) newLevels oldLevels = do
 						deleteFlag = not mergeNoDeletes && Maybe.isNothing mbValue
 						addToLen = (if specialFlag then 1 else 0) + (if deleteFlag then 2 else 0)
 						shift = if mergeNoDeletes then 1 else 2
-						keyEnc = encodeByteStringWithLength shift addToLen key
 						dataLen = fromIntegral $ maybe 0 BS.length mbValue
-						dataEnc = Maybe.fromMaybe mempty $ fmap (\v -> if BS.null v then mempty else encodeByteStringWithLength 0 0 v) mbVal
+						dataEnc = Maybe.fromMaybe mempty $ fmap (\v -> if BS.null v then mempty else lazyByteString v) mbVal
+						dataLenEnc = if dataLen > 0 then encodeLength 0 0 dataLen else mempty
+						keyLenEnc = encodeLength shift addToLen keyLen
 					return $ wr {
-						  wrBuffer = mconcat [wrBuffer wr, keyEnc, dataEnc]
+						  wrBuffer = mconcat [wrBuffer wr, keyLenEnc, dataLenEnc, lazyByteString key, dataEnc]
 						, wrKeysWritten = let kw' = wrKeysWritten wr + 1 in
 							if kw' >= branching then kw' - branching else kw'
-						, wrKeysSize = BS.length key + wrKeysSize wr
+						, wrKeysSize = fromIntegral (BS.length key) + wrKeysSize wr
 						, wrDataSize = dataLen + wrDataSize wr
 						}
 				go indexWr mbValue wr [] = do
@@ -758,7 +776,7 @@ mergeProcess lsm memPart@(memCnt, memKS, memDS, memMap) newLevels oldLevels = do
 					computeMerge (null oldLevels) forceMergeAllNew (memCnt, (memKS+memDS), [IMem memMap]) newLevels
 		computeMerge lastLevelLast forceAdd iters [] = (iters, [])
 		computeMerge lastLevelLast forceAdd iters@(cnt, size, itersRev) rest@(level:levels)
-			| add = computeMerge lastLevelLast forceAdd (cnt+lcnt, size+lsize, IDisk (DiskIter hasDeletes True 0 16 mempty lblocks []) : itersRev) levels
+			| add = computeMerge lastLevelLast forceAdd (cnt+lcnt, size+lsize, IDisk (DiskIter False hasDeletes True 0 0 16 mempty lblocks []) : itersRev) levels
 			| otherwise = (iters, rest)
 			where
 				add = forceAdd || lsize <= 2 * size
@@ -826,21 +844,128 @@ replaceOldestState lsm levels = do
 			}
 
 startIterator :: LSMCmdChan -> WideInt -> WideInt -> Bool -> Bool -> LSMRun -> IO DiskIter
-startIterator chan page offset hasDels hasSpecl run = do
+startIterator chan page offset hasDels hasSpecl run
+	| page >= sum (map lsmbSize blocks) = internal $ "page "++show page++" is outside of blocks of run: "++show blocks
+	| otherwise = do
 	return $ DiskIter {
-		  diHasDeletes		= hasDels
+		  diDone		= False
+		, diHasDeletes		= hasDels
 		, diHasSpecial		= hasSpecl
 		, diPageOffset		= offset
+		, diPageIndex		= page
 		, diPagesPreread	= 2	-- should be computed from level stats, actually, or from branching factor and distance in pages between positions in index.
-		, diBuffer		= mempty
-		, diBlocks		= skipToPage page $ lsmrBlocks run
+		, diBuffer		= BS.empty
+		, diBlocks		= blocks
 		, diKVs			= []
 		}
 	where
-		skipToPage page [] = internal $ "page "++show page++" outside of run blocks: "++show run
-		skipToPage page (b:bs)
-			| page < lsmbSize b = LSMBlock (lsmbAddr b + page) (lsmbSize b - page) : bs
-			| otherwise = skipToPage (page - lsmbSize b) bs
+		blocks = lsmrBlocks run
+
+diskIterKeyLenShift :: DiskIter -> Int
+diskIterKeyLenShift di
+	| not $ diHasSpecial di = 0
+	| not $ diHasDeletes di = 1
+	| otherwise = 2
+
+diskIterCurrentLogicalPageBlock :: DiskIter -> LSMBlock
+diskIterCurrentLogicalPageBlock iter = findPageBlockAbs (diPageIndex iter) (diBlocks iter)
+
+internalReadIter :: LSM -> DiskIter -> IO DiskIter
+internalReadIter lsm iter
+	-- Finished.
+	| diDone iter = return iter
+	-- has some key-value pairs.
+	| not $ null (diKVs iter) = return iter
+	| otherwise = readPairs iter
+	where
+		keyLenShift = diskIterKeyLenShift iter
+		blocks = diBlocks iter
+		builderBuf = diBuffer iter
+		readDataIn pagesNeeded lsm iter = do
+			putStrLn $ "reading data for iter "++show iter
+			let	LSMBlock addr size = diskIterCurrentLogicalPageBlock iter
+				count = min size pagesNeeded
+			pages' <- readLogicalPages lsm addr count
+			let	ofs = diPageOffset iter
+				pages = if ofs > 0 then BS.drop (fromIntegral ofs) pages' else pages'
+				iter' = iter {
+					  diBuffer = BS.concat [diBuffer iter, pages]
+					, diPageOffset = 0
+					, diPageIndex = diPageIndex iter + count
+					}
+			return iter'
+		parsePair buf
+			-- too small even for key length.
+			| not canReadKeyLen = Left 1
+			-- has key length, and key length is zero (end of data).
+			| keyLen' == 0 = Left 0
+			-- has key length, but no data length.
+			| not canReadDataLen = Left 1	-- TODO: convert key length to pages, maybe? experiment one day.
+			| wholeOrdealSize > bufLen = Left $ lsmBytesPages lsm wholeOrdealSize
+			-- has enough data for key length, data length, key and data.
+			| otherwise = Right ((k,v), afterData)
+			where
+				bufLen = bystrLen buf
+				keyLenBytes = decodeNeedBytes buf
+				canReadKeyLen = bufLen >= keyLenBytes
+				(keyLen', bufAfterKeyLen) = decodeWideInt buf
+				dataLenBytes = decodeNeedBytes bufAfterKeyLen
+				zeroDataLen = odd keyLen'
+				deletedData = odd (shiftR keyLen' 1)
+				keyLen = shiftR keyLen' keyLenShift
+				wholeOrdealSize = keyLenBytes + dataLenBytes + keyLen + dataLen
+				(k, afterKey) = BS.splitAt (fromIntegral keyLen) bufAfterDataLen
+				(v, afterData)
+					| diHasDeletes iter && deletedData = (Nothing, afterKey)
+					| diHasSpecial iter && zeroDataLen = (Just BS.empty, afterKey)
+					| otherwise = let (v,r) = BS.splitAt (fromIntegral dataLen) afterKey in (Just v, r)
+				(canReadDataLen, (dataLen, bufAfterDataLen))
+					| diHasSpecial iter && zeroDataLen = (True, (0, bufAfterKeyLen))
+					| otherwise = (dataLenBytes <= bystrLen bufAfterKeyLen, decodeWideInt bufAfterKeyLen)
+		parsePairs buf = case parsePair buf of
+			Left pagesNeed -> Left pagesNeed
+			ekvb -> let
+					fromRight = either (internal "can't be Left") id
+					kvbs = map fromRight $ takeWhile isRight (iterate (parsePair . snd . fromRight) ekvb)
+					buf = snd $ last kvbs
+				in Right (map fst kvbs, buf)
+		readPairs iter = case parsePairs buf of
+			Left pagesNeed
+				| pagesNeed == 0  -> return iter {diDone = True}
+				| otherwise -> do
+					iter' <- readDataIn (max pagesNeed $ diPagesPreread iter) lsm iter
+					readPairs iter'
+			Right (kvs, buf') -> return iter { diBuffer = buf', diKVs = kvs }
+			where
+				buf = diBuffer iter
+
+navigateIterForKey :: LSMCmdChan -> BS.ByteString -> DiskIter -> IO (Maybe (Maybe BS.ByteString), DiskIter)
+navigateIterForKey cmdChan key diskIter
+	| diDone diskIter = return (Nothing, diskIter)
+	| null kvs = do
+		result <- newEmptyMVar
+		writeChan cmdChan $ ReadIter diskIter result
+		diskIter <- takeMVar result
+		navigateIterForKey cmdChan key diskIter
+	| otherwise = case skipped of
+		(Nothing, []) -> navigateIterForKey cmdChan key $ diskIter { diKVs = [] }
+		(v, kvs) -> return (v, diskIter { diKVs = kvs })
+	where
+		kvs = diKVs diskIter
+		skipped = skip 1 kvs
+		skip n [] = (Nothing, [])
+		skip 1 kvs@((k,v):kvs') = case compare key k of
+			EQ -> (Just v, kvs')
+			LT -> (Nothing, kvs)
+			GT -> skip 2 kvs'
+		skip n kvs = case compare key upk of
+			EQ -> (Just upv, rest)
+			LT -> let (v',rest') = skip 1 (init look) in
+				(v',rest'++rest)
+			GT -> skip (2*n) rest
+			where
+				up@(upk,upv) = last look
+				(look, rest) = List.splitAt n kvs
 
 
 readInLevels :: LSMCmdChan -> BS.ByteString -> [LSMLevel] -> IO (Maybe BS.ByteString)
@@ -853,10 +978,10 @@ readInLevels chan key (level:levels) = do
 	where
 		hasDels = not $ null levels
 		readInLevel page offset [keyDataRun] = do
-			diskIter <- startIterator chan page offset hasDels False keyDataRun
-			result <- newEmptyMVar
-			writeChan chan $ ReadIter diskIter result
-			ned "readInLevel iter read"
+			diskIter <- startIterator chan page offset hasDels True keyDataRun
+			(mbValue, diskIter) <- navigateIterForKey chan key diskIter
+			
+			return $ Maybe.fromMaybe Nothing mbValue
 		readInLevel page offset (keyPageOfsRun:kpors) = error "read in key-pos level!"
 
 -------------------------------------------------------------------------------
@@ -873,9 +998,8 @@ lsmWorker lsm = do
 			putStrLn $ "lsmInfo "++show (lsmInfo lsm)
 			putMVar result levelsToCopy
 			lsmWorker lsm'
-		Release levels -> do
-			let	blocksToRelease = Map.unions $ map (\b -> Map.singleton (lsmbAddr b) (1, lsmbSize b)) $
-					concatMap lsmrBlocks $ concatMap lsmlRuns levels
+		Release blocks -> do
+			let	blocksToRelease = Map.unions $ map (\b -> Map.singleton (lsmbAddr b) (1, lsmbSize b)) $ blocks
 				blocksRemain = Map.mergeWithKey
 					(\_a (cnt, b) (dec, size) -> let r = cnt - dec in if r < 1 then Nothing else Just (r, b))
 					id
@@ -914,7 +1038,8 @@ lsmWorker lsm = do
 			lsmWorker lsm'
 		ReadIter diskIter result -> do
 			diskIter' <- if null (diKVs diskIter)
-				then ned "ReadIter action"
+				then do
+					internalReadIter lsm diskIter
 				else return diskIter
 			putMVar result diskIter'
 			lsmWorker lsm
@@ -1017,7 +1142,7 @@ lsmWriteInternal txn key value = withTxn "lsmWrite" txn $ \txni -> do
 				}
 			Nothing -> txni {
 				  lsmtiMemDataSize = lsmtiMemDataSize txni + vlen value
-				, lsmtiMemKeysSize = lsmtiMemKeysSize txni + BS.length key
+				, lsmtiMemKeysSize = lsmtiMemKeysSize txni + fromIntegral (BS.length key)
 				, lsmtiMemKeysCount = lsmtiMemKeysCount txni+1
 				, lsmtiMemory = newMem
 				}
@@ -1026,7 +1151,7 @@ lsmWriteInternal txn key value = withTxn "lsmWrite" txn $ \txni -> do
 		else return txni'
 	return (Just txni'', ())
 	where
-		vlen = maybe 0 BS.length
+		vlen = fromIntegral . maybe 0 BS.length
 
 lsmWrite :: LSMTxn -> BS.ByteString -> BS.ByteString -> IO ()
 lsmWrite txn key value = lsmWriteInternal txn key (Just value)

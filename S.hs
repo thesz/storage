@@ -305,6 +305,27 @@ decodeNeedBytes bs
 		eightN = threeN+8-3
 		n = fromIntegral $ BS.head bs
 
+type DecodeM a = State BS.ByteString a
+
+decodeWideIntM :: DecodeM WideInt
+decodeWideIntM = do
+	s <- get
+	let	(r,s') = decodeWideInt s
+	put s'
+	return r
+
+decodeListM :: DecodeM a -> DecodeM [a]
+decodeListM decoder = do
+	n <- decodeWideIntM
+	liftM reverse $ foldM (\list _ -> decoder >>= \x -> return (x:list)) [] [1..n]
+
+decodeLSMRunTypeM :: DecodeM LSMRunType
+decodeLSMRunTypeM = do
+	s <- get
+	let	(ty,s') = decodeLSMRunType s
+	put s'
+	return ty
+
 decodeNeedBuilderBytes :: Builder -> WideInt
 decodeNeedBuilderBytes bld = decodeNeedBytes $ toLazyByteString bld
 
@@ -378,6 +399,62 @@ writeHeader lsm = do
 			, encodeWideInt (lsmhStatesCount hdr)
 			, encodeWideInt (lsmhStateRecSize hdr)
 			]
+
+readHeaderInfo :: LSM -> IO LSM
+readHeaderInfo lsm = do
+	lsm' <- readHeader lsm
+	let	hdr = lsmiHeader $ lsmInfo lsm'
+	when (lsmhVersion hdr /= 0) $ error "invalid header version!"
+	when (lsmhStatesCount hdr > 9 || lsmhStatesCount hdr < 1) $ error "invalid states count!"
+	when (lsmhStateRecSize hdr > 128*1024 || lsmhStateRecSize hdr < 16*1024) $ error "invalid state record size!"
+	states <- foldM (\states i -> readState lsm' i >>= \s -> return (states ++[s])) [] [0..lsmhStatesCount hdr - 1]
+	putStrLn $ "LSM states read: "++show states
+	return $ lsm' { lsmInfo = (lsmInfo lsm') { lsmiStates = states } }
+	where
+		readState lsm i = do
+			statePages <- readPhysicalPages lsm (lsmStatePage lsm i) (lsmStateRecPages lsm)
+			let	run = do
+					runTy <- decodeLSMRunTypeM
+					blocks <- decodeListM $ liftM2 LSMBlock decodeWideIntM decodeWideIntM
+					return $ LSMRun runTy blocks
+				level = do
+					pairsCount <- decodeWideIntM
+					keysSize <- decodeWideIntM
+					dataSize <- decodeWideIntM
+					runs <- decodeListM run
+					return $ LSMLevel {
+						  lsmlPairsCount	= pairsCount
+						, lsmlKeysSize		= keysSize
+						, lsmlDataSize		= dataSize
+						, lsmlRuns		= runs
+						}
+				state = flip evalState statePages $ do
+					seqIndex <- decodeWideIntM
+					levels <- decodeListM level
+					return $ LSMState {
+						  lsmsPhysIndex		= i
+						, lsmsSeqIndex		= seqIndex
+						, lsmsLevels		= levels
+						}
+			return state
+		readHeader lsm = do
+			hdrBytes <- readPhysicalPages lsm 0 1
+			let	lsm' = flip evalState hdrBytes $ do
+					version <- decodeWideIntM
+					pageShift <- liftM fromIntegral decodeWideIntM
+					statesCount <- decodeWideIntM
+					stateRecSize <- decodeWideIntM
+					let	hdr = LSMHeader {
+							  lsmhVersion		= version
+							, lsmhPageShift		= pageShift
+							, lsmhPageSize		= shiftL 1 pageShift
+							, lsmhStatesCount	= statesCount
+							, lsmhStateRecSize	= stateRecSize
+							, lsmhStateRecPages	= lsmBytesPages lsm' stateRecSize
+							}
+						lsm' = lsm { lsmInfo = (lsmInfo lsm) { lsmiHeader = hdr } }
+					return lsm'
+			return lsm'
 
 readLogicalPages :: LSM -> WideInt -> WideInt -> IO BS.ByteString
 readLogicalPages lsm addr npages = readPhysicalPages lsm (addr + lsmPhysPagesStart lsm) npages
@@ -1061,15 +1138,15 @@ newLSMWithConfig pageBits statesCount forceCreate path
 	lsm <- do
 		h <- openBinaryFile path ReadWriteMode
 		size <- hFileSize h
+		let	info = emptyLSMInfo pageBits (fromIntegral statesCount)
+			pages = fromIntegral $ div size (fromIntegral $ lsmInfoPageSize info)
+			lsm = mkLSM info ch h pages
 		if forceCreate
 			then do
-				let	info = emptyLSMInfo pageBits (fromIntegral statesCount)
-					pages = fromIntegral $ div size (fromIntegral $ lsmInfoPageSize info)
-					lsm = mkLSM info ch h pages
 				writeHeader lsm
 				writeStates lsm	-- this syncs. ;)
 				return lsm
-			else error "reading LSM info!"
+			else readHeaderInfo lsm
 	forkIO $ lsmWorker lsm
 	return $ lsmCmdChan lsm
 

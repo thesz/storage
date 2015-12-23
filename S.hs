@@ -62,6 +62,9 @@ defaultFlushSize = 8*1024*1024
 minSizeIncrement :: WideInt
 minSizeIncrement = defaultMemoryPartSize*2
 
+defaultBranchingFactor :: WideInt
+defaultBranchingFactor = 128
+
 -------------------------------------------------------------------------------
 -- Data types.
 
@@ -353,7 +356,7 @@ mkLSM info chan handle filePages = let lsm = LSM {
 		, lsmFreeBlocks		= freeBlocks 0 $ map snd $ Map.elems counts
 		, lsmHandle		= handle
 		, lsmPhysPagesStart	= lsmhStateRecPages (lsmHeader lsm) * fromIntegral (length $ lsmiStates $ lsmInfo lsm) + 1
-		, lsmBranching		= 1024
+		, lsmBranching		= defaultBranchingFactor
 		, lsmPagePreread	= 4
 		, lsmFlushThreshold	= defaultFlushSize
 		}
@@ -404,9 +407,9 @@ readHeaderInfo :: LSM -> IO LSM
 readHeaderInfo lsm = do
 	lsm' <- readHeader lsm
 	let	hdr = lsmiHeader $ lsmInfo lsm'
-	when (lsmhVersion hdr /= 0) $ error "invalid header version!"
-	when (lsmhStatesCount hdr > 9 || lsmhStatesCount hdr < 1) $ error "invalid states count!"
-	when (lsmhStateRecSize hdr > 128*1024 || lsmhStateRecSize hdr < 16*1024) $ error "invalid state record size!"
+	when (lsmhVersion hdr /= 0) $ internal "invalid header version!"
+	when (lsmhStatesCount hdr > 9 || lsmhStatesCount hdr < 1) $ internal "invalid states count!"
+	when (lsmhStateRecSize hdr > 128*1024 || lsmhStateRecSize hdr < 16*1024) $ internal "invalid state record size!"
 	states <- foldM (\states i -> readState lsm' i >>= \s -> return (states ++[s])) [] [0..lsmhStatesCount hdr - 1]
 	putStrLn $ "LSM states read: "++show states
 	return $ lsm' { lsmInfo = (lsmInfo lsm') { lsmiStates = states } }
@@ -640,7 +643,7 @@ makeLevel runs kdWriter = LSMLevel {
 
 allocateBlock :: WideInt -> LSM -> (LSM, LSMBlock)
 allocateBlock size lsm
-	| null goodBlocks = error "null goodBlocks!"
+	| null goodBlocks = internal "null goodBlocks!"
 	| otherwise = (withBestBlock, allocated)
 	where
 		freeBlocks = lsmFreeBlocks lsm
@@ -663,7 +666,7 @@ writerPageStart :: Writer -> WideInt
 writerPageStart wr = find absPage (wrBlocks wr)
 	where
 		absPage = wrAbsPageIndex wr
-		find index [] = error $ "writerPageStart: index not found: "++show wr
+		find index [] = internal $ "writerPageStart: index not found: "++show wr
 		find index (b:bs)
 			| index < lsmbSize b = lsmbAddr b + index
 			| otherwise = find (index - lsmbSize b) bs
@@ -752,9 +755,9 @@ mergeProcess lsm memPart@(memCnt, memKS, memDS, memMap) newLevels oldLevels = do
 								, wrBuffer = mempty
 								}
 						return (lsm, wr)
-					else error "bufPages < pagesRemain."
+					else ned "bufPages < pagesRemain."
 			| overflow = do
-				error $ "allocate and call again, pagesRemain "++show pagesRemain++"\nwriter "++show writer
+				ned $ "allocate and call again, pagesRemain "++show pagesRemain++"\nwriter "++show writer
 			| otherwise = return (lsm, writer)
 			where
 				overflow = bufPages > pagesRemain || final
@@ -768,7 +771,7 @@ mergeProcess lsm memPart@(memCnt, memKS, memDS, memMap) newLevels oldLevels = do
 			where
 				keyLen = fromIntegral $ BS.length key
 				writeIndexSeq mbValue wr = do
-					let	value = Maybe.fromMaybe (error "nothing for index seq?") mbValue
+					let	value = Maybe.fromMaybe (internal "nothing for index seq?") mbValue
 						add = mconcat [encodeLength 0 0 keyLen, encodeLength 0 0 (fromIntegral $ BS.length value), lazyByteString key, lazyByteString value]
 					return $ wr {
 						  wrBuffer = mappend (wrBuffer wr) add
@@ -801,13 +804,26 @@ mergeProcess lsm memPart@(memCnt, memKS, memDS, memMap) newLevels oldLevels = do
 						then writeIndexSeq mbValue wr
 						else writeKeyDataSeq mbValue wr
 					return $ wr : wrs
-		encodePos wr = error "encode pos!"
+		encodePos wr = toLazyByteString $
+			mconcat $ map encodeWideInt [wrAbsPageIndex wr, fromIntegral $ builderLength $ wrBuffer wr]
 		putIter n iter prioQ = do
 			readResult <- readIterValue lsm iter
 			case readResult of
-				Just (key, mbVal) -> error "some read!"
+				Just ((key, value), iter') -> case maybePrevValue of
+					Just (oldn, oldv, olditer)
+						-- the value in priority queue was more recent. we'll reread and add again.
+						-- priority queue was not changed, actually, so we use old copy.
+						| oldn < n -> putIter n iter' prioQ
+						-- we have more recent value. the old iterator has to read and add.
+						-- priority queue was changed, use new.
+						| otherwise -> putIter oldn olditer prioQ'
+					-- the key is absent in priority queue, success!
+					Nothing -> return prioQ'
 					where
-						
+						select _ new old@(oldn, oldMbVal, oldIter)
+							| oldn < n = old
+							| otherwise = new
+						(maybePrevValue, prioQ') = Map.insertLookupWithKey select key (n,value,iter') prioQ
 				Nothing -> return prioQ
 		mergeNoDeletes = null rem
 		readFirstValue map (n,iter) = do
@@ -889,7 +905,7 @@ mergeFree a@(lb1:lb1s) b@(lb2:lb2s)
 	| t2 < a1 = lb2 : mergeFree a lb2s
 	| t1 == a2 = mergeFree (LSMBlock a1 (lsmbSize lb1 + lsmbSize lb2) : lb1s) lb2s
 	| t2 == a1 = mergeFree (LSMBlock a2 (lsmbSize lb1 + lsmbSize lb2) : lb1s) lb2s
-	| otherwise = error $ "blocks are not disjoint or adjacent.\na: "++show a++"\nb: "++show b
+	| otherwise = internal $ "blocks are not disjoint or adjacent.\na: "++show a++"\nb: "++show b
 	where
 		a1 = lsmbAddr lb1
 		a2 = lsmbAddr lb2
@@ -1016,33 +1032,53 @@ internalReadIter lsm iter
 			where
 				buf = diBuffer iter
 
-navigateIterForKey :: LSMCmdChan -> BS.ByteString -> DiskIter -> IO (Maybe (Maybe BS.ByteString), DiskIter)
-navigateIterForKey cmdChan key diskIter
+navigateIterForKey :: Bool -> LSMCmdChan -> BS.ByteString -> DiskIter -> IO (Maybe (Maybe BS.ByteString), DiskIter)
+navigateIterForKey lessOrEq cmdChan key diskIter
 	| diDone diskIter = return (Nothing, diskIter)
 	| null kvs = do
 		result <- newEmptyMVar
 		writeChan cmdChan $ ReadIter diskIter result
 		diskIter <- takeMVar result
-		navigateIterForKey cmdChan key diskIter
+		navigateIterForKey lessOrEq cmdChan key diskIter
 	| otherwise = case skipped of
-		(Nothing, []) -> navigateIterForKey cmdChan key $ diskIter { diKVs = [] }
+		(Nothing, []) -> navigateIterForKey lessOrEq cmdChan key $ diskIter { diKVs = [] }
+		(Nothing, kvs@((k,v) : kvs'))
+			| lessOrEq -> return (Just v, diskIter { diKVs = kvs })
+			| otherwise -> return (Nothing, diskIter { diKVs = kvs })
 		(v, kvs) -> return (v, diskIter { diKVs = kvs })
 	where
 		kvs = diKVs diskIter
-		skipped = skip 1 kvs
-		skip n [] = (Nothing, [])
-		skip 1 kvs@((k,v):kvs') = case compare key k of
-			EQ -> (Just v, kvs')
-			LT -> (Nothing, kvs)
-			GT -> skip 2 kvs'
-		skip n kvs = case compare key upk of
-			EQ -> (Just upv, rest)
-			LT -> let (v',rest') = skip 1 (init look) in
-				(v',rest'++rest)
-			GT -> skip (2*n) rest
-			where
-				up@(upk,upv) = last look
-				(look, rest) = List.splitAt n kvs
+		skipped
+			| lessOrEq = skipRemember Nothing key 1 kvs
+			| otherwise = skip key 1 kvs
+
+skip key n [] = (Nothing, [])
+skip key 1 kvs@((k,v):kvs') = case compare key k of
+	EQ -> (Just v, kvs')
+	LT -> (Nothing, kvs)
+	GT -> skip key 2 kvs'
+skip key n kvs = case compare key upk of
+	EQ -> (Just upv, rest)
+	LT -> let (v',rest') = skip key 1 look in
+		(v',rest'++rest)
+	GT -> skip key (2*n) rest
+	where
+		up@(upk,upv) = last look
+		(look, rest) = List.splitAt n kvs
+
+skipRemember lt key n [] = (Nothing, Maybe.maybeToList lt)
+skipRemember lt key 1 kvs@((k,v):kvs') = case compare key k of
+	EQ -> (Just v, kvs')
+	LT -> (Nothing, Maybe.maybeToList lt ++ kvs)
+	GT -> skipRemember (Just (k,v)) key 2 kvs'
+skipRemember lt key n kvs = case compare key upk of
+	EQ -> (Just upv, rest)
+	LT -> let (v',rest') = skipRemember lt key 1 look in
+		(v',rest'++rest)
+	GT -> skipRemember (Just up) key (2*n) rest
+	where
+		up@(upk,upv) = last look
+		(look, rest) = List.splitAt n kvs
 
 
 readInLevels :: LSMCmdChan -> BS.ByteString -> [LSMLevel] -> IO (Maybe BS.ByteString)
@@ -1056,10 +1092,19 @@ readInLevels chan key (level:levels) = do
 		hasDels = not $ null levels
 		readInLevel page offset [keyDataRun] = do
 			diskIter <- startIterator chan page offset hasDels True keyDataRun
-			(mbValue, diskIter) <- navigateIterForKey chan key diskIter
-			
+			(mbValue, diskIter) <- navigateIterForKey False chan key diskIter
+			internalReleaseBlocks chan $ lsmrBlocks keyDataRun
 			return $ Maybe.fromMaybe Nothing mbValue
-		readInLevel page offset (keyPageOfsRun:kpors) = error "read in key-pos level!"
+		readInLevel page offset (keyPageOfsRun:kpors) = do
+			diskIter <- startIterator chan page offset False False keyPageOfsRun
+			(mbValue, diskIter) <- navigateIterForKey True chan key diskIter
+			internalReleaseBlocks chan $ lsmrBlocks keyPageOfsRun
+			case mbValue of
+				Just (Just pos) -> do
+					let	(page, ofs) = evalState (liftM2 (,) decodeWideIntM decodeWideIntM) pos
+					putStrLn $ "Read position: "++show (pos, (page, ofs))
+					readInLevel page ofs kpors
+				Nothing -> return Nothing
 
 -------------------------------------------------------------------------------
 -- Worker loop.
@@ -1080,7 +1125,7 @@ lsmWorker lsm = do
 				blocksRemain = Map.mergeWithKey
 					(\_a (cnt, b) (dec, size) -> let r = cnt - dec in if r < 1 then Nothing else Just (r, b))
 					id
-					(error . ("blocks to free that are not in alloced blocks: " ++) . show)
+					(internal . ("blocks to free that are not in alloced blocks: " ++) . show)
 					(lsmBlockCounts lsm) blocksToRelease
 				releasedBlocks = Map.toList $ Map.difference blocksToRelease blocksRemain
 				freeBlocks = mergeFree (lsmFreeBlocks lsm) $ map (\(a,(_,size)) -> LSMBlock a size) releasedBlocks
@@ -1108,9 +1153,9 @@ lsmWorker lsm = do
 					-- no change.
 					| memCounts == 0 && levels == recentLevels -> return lsm
 					-- everything is on disk (can happen).
-					| memCounts == 0 -> error "SI: need to change levels!"
+					| memCounts == 0 -> ned "SI: need to change levels!"
 					-- performing merge.
-					| otherwise -> error "SI: need to merge with mem!"
+					| otherwise -> ned "SI: need to merge with mem!"
 			putMVar lock ()
 			lsmWorker lsm'
 		ReadIter diskIter result -> do
@@ -1132,7 +1177,7 @@ lsmWorker lsm = do
 --
 newLSMWithConfig :: Int -> Int -> Bool -> FilePath -> IO LSMCmdChan
 newLSMWithConfig pageBits statesCount forceCreate path
-	| finiteBitSize (1::Int) < finiteBitSize (1::WideInt) = error "need 64+-bit platform."
+	| finiteBitSize (1::Int) < finiteBitSize (1::WideInt) = internal "need 64+-bit platform."
 	| otherwise = do
 	ch <- newChan
 	lsm <- do
@@ -1179,7 +1224,7 @@ lsmBegin isolLevel chan = do
 			, lsmtiMemKeysCount	= 0
 			, lsmtiMemKeysSize	= 0
 			, lsmtiMemDataSize	= 0
-			, lsmtiLevels		= error "txni levels unset"
+			, lsmtiLevels		= internal "txni levels unset"
 			, lsmtiMemThreshold	= defaultMemoryPartSize
 			}
 
@@ -1187,7 +1232,7 @@ lsmBegin isolLevel chan = do
 -- |Begin a nested transaction.
 lsmNest :: LSMTxn -> IO LSMTxn
 lsmNest txn = do
-	error "beginnest!"
+	ned "nested txn!"
 
 -- |Commit a transaction. Any attempt to do anything past commit/rollback will result in error.
 -- Please do not leave dangling transactions (not committed/rolled back). They would create memory/other info leak.
@@ -1224,7 +1269,7 @@ lsmWriteInternal txn key value = withTxn "lsmWrite" txn $ \txni -> do
 				, lsmtiMemory = newMem
 				}
 	txni'' <- if lsmtiMemDataSize txni' + lsmtiMemKeysSize txni' >= lsmtiMemThreshold txni'
-		then error "flush!"
+		then ned "flush in internal write!"
 		else return txni'
 	return (Just txni'', ())
 	where

@@ -62,7 +62,33 @@ testWriteCommitCloseOpenReadRollback = do
 	lsmClose lsm
 	done
 
+testWriteUpTo16KCommitCloseOpenReadRollback = do
+	forM (takeWhile (<=16384) $ iterate (*2) 2) $ test
+	done
+	where
+		test n = do
+			putStrLn $ "testing portion of size "++show n
+			lsm <- newLSM True file
+			tx <- lsmBegin ReadCommitted lsm
+			forM_ [1..n] $ \i -> do
+				let	k = mkBS $ show i
+					v = mkBS $ show (i+n)
+				lsmWrite tx k v
+			lsmCommit tx
+			lsmClose lsm
+			lsm <- newLSM False file
+			tx <- lsmBegin ReadCommitted lsm
+			forM_ [1..n] $ \i -> do
+				let	k = mkBS $ show i
+					v = mkBS $ show (i+n)
+				v' <- lsmRead tx k
+				when (v' /= Just v) $ error $ "expected " ++ show (Just v) ++", got "++show v'
+			lsmRollback tx
+			lsmClose lsm
+
+
 main = do
+	testWriteUpTo16KCommitCloseOpenReadRollback
 	testWriteCommitCloseOpenReadRollback
 	testWriteCommitReadRollback
 	testWriteReadRollback

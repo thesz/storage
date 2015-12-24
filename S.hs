@@ -51,7 +51,7 @@ ned msg = error $ "not yet done: "++msg
 -- Constants.
 
 defaultPageBits :: Int
-defaultPageBits = 13
+defaultPageBits = 7
 
 defaultMemoryPartSize :: WideInt
 defaultMemoryPartSize = 256*1024
@@ -63,7 +63,10 @@ minSizeIncrement :: WideInt
 minSizeIncrement = defaultMemoryPartSize*2
 
 defaultBranchingFactor :: WideInt
-defaultBranchingFactor = 128
+defaultBranchingFactor = 8
+
+defaultCommitRecordSize :: WideInt
+defaultCommitRecordSize = 1024
 
 -------------------------------------------------------------------------------
 -- Data types.
@@ -135,9 +138,7 @@ lsmInfoHeaderPages lsmi = lsmhStatesCount h * (lsmhStateRecSize h + ps `div` ps)
 defaultLSMHeader :: Int -> WideInt -> LSMHeader
 defaultLSMHeader pageBits statesCount
 	| pageBits < 6 = unsupported "page size less than 64 is not supported."
-	| otherwise = LSMHeader 0 pageBits (shiftL 1 pageBits) statesCount defRecSize (shiftR defRecSize pageBits)
-	where
-		defRecSize = 32768
+	| otherwise = LSMHeader 0 pageBits (shiftL 1 pageBits) statesCount defaultCommitRecordSize (shiftR defaultCommitRecordSize pageBits)
 
 data LSMHeader = LSMHeader {
 	  lsmhVersion		:: WideInt
@@ -272,7 +273,17 @@ encodeWideInt n
 		writeBytes [fromIntegral $ encode1ByteLim+shiftR n' 8, fromIntegral n']
 	| n < encode3ByteLim = let n' = n - encode2ByteLim in
 		writeBytes [fromIntegral $ encode1ByteLim+encode2BytesN, fromIntegral $ shiftR n' 8, fromIntegral n']
-	| otherwise = internal "encoding!"
+	| n < shiftL 1 24 = bytesAndCode 1 16
+	| n < shiftL 1 32 = bytesAndCode 2 24
+	| n < shiftL 1 40 = bytesAndCode 3 32
+	| n < shiftL 1 48 = bytesAndCode 4 40
+	| n < shiftL 1 56 = bytesAndCode 5 48
+	| otherwise = bytesAndCode 6 56
+	where
+		bytesAndCode l shift = writeBytes $ (fromIntegral $ l+encode1ByteLim+encode2BytesN) : bytes shift
+		bytes shift
+			| shift == 0 = [fromIntegral n]
+			| otherwise = fromIntegral (shiftR n shift) : bytes (shift-8)
 
 decodeWideInt :: BS.ByteString -> (WideInt, BS.ByteString)
 decodeWideInt bs = case split of
@@ -280,10 +291,10 @@ decodeWideInt bs = case split of
 	Just (n,bs')
 		| n < fromIntegral encode1ByteLim -> (fromIntegral n, bs')
 		| n < fromIntegral (encode1ByteLim+encode2BytesN) ->
-			decode 1 encode1ByteLim
+			let m = fromIntegral n - encode1ByteLim in decode 1 (encode1ByteLim + m * 256)
 		| n == fromIntegral (encode1ByteLim+encode2BytesN) ->
 			decode 2 encode2ByteLim
-		| n < fromIntegral (encode1ByteLim+encode2BytesN+6) -> decode (n-fromIntegral (encode1ByteLim+encode2BytesN)) 0
+		| n < fromIntegral (encode1ByteLim+encode2BytesN+6) -> decode (n-fromIntegral (encode1ByteLim+encode2BytesN)+3) 0
 		| otherwise -> decode ((n-fromIntegral (encode1ByteLim+encode2BytesN+6))*2+8) 0
 		where
 			decode len add = (v+add, bs'')
@@ -409,7 +420,8 @@ readHeaderInfo lsm = do
 	let	hdr = lsmiHeader $ lsmInfo lsm'
 	when (lsmhVersion hdr /= 0) $ internal "invalid header version!"
 	when (lsmhStatesCount hdr > 9 || lsmhStatesCount hdr < 1) $ internal "invalid states count!"
-	when (lsmhStateRecSize hdr > 128*1024 || lsmhStateRecSize hdr < 16*1024) $ internal "invalid state record size!"
+	when (lsmhStateRecSize hdr > 128*1024) $ internal $ "state record size "++show (lsmhStateRecSize hdr)++" is too big."
+	when (lsmhStateRecSize hdr < 1024) $ internal $ "state record size "++show (lsmhStateRecSize hdr)++" is too small."
 	states <- foldM (\states i -> readState lsm' i >>= \s -> return (states ++[s])) [] [0..lsmhStatesCount hdr - 1]
 	putStrLn $ "LSM states read: "++show states
 	return $ lsm' { lsmInfo = (lsmInfo lsm') { lsmiStates = states } }
@@ -608,13 +620,14 @@ readIterValue lsm (IDisk diskIter) = do
 
 -- |Writer to disk or memory.
 data Writer = Writer {
-	  wrAllocPagesCount	:: WideInt	-- how many pages allocate to a next block. calculated in advance and does not change.
-	, wrAbsPageIndex	:: WideInt	-- index of page as if they all are continuous.
-	, wrKeysWritten		:: WideInt	-- number of keys written (data may be missing or not data (reference)).
-	, wrKeysSize		:: WideInt	-- size of keys written.
-	, wrDataSize		:: WideInt	-- size of data written
-	, wrBlocks		:: [LSMBlock]	-- blocks allocated for a writer. writer fills the last one.
-	, wrBuffer		:: Builder	-- buffer of data to write.
+	  wrAllocPagesCount		:: WideInt	-- how many pages allocate to a next block. calculated in advance and does not change.
+	, wrAbsPageIndex		:: WideInt	-- index of page as if they all are continuous.
+	, wrKeysWritten			:: WideInt	-- number of keys written (data may be missing or not data (reference)).
+	, wrKeysWrittenModBranch	:: WideInt
+	, wrKeysSize			:: WideInt	-- size of keys written.
+	, wrDataSize			:: WideInt	-- size of data written
+	, wrBlocks			:: [LSMBlock]	-- blocks allocated for a writer. writer fills the last one.
+	, wrBuffer			:: Builder	-- buffer of data to write.
 	}
 	deriving Show
 
@@ -683,6 +696,7 @@ mergeProcess lsm memPart@(memCnt, memKS, memDS, memMap) newLevels oldLevels = do
 	putStrLn $ "starting priority queue."
 	prioQ <- foldM readFirstValue Map.empty resultIters
 	(newLevel, lsm) <- merge lsm writers prioQ
+	putStrLn $ "newLevel: "++show newLevel
 	putStrLn $ "resulting free blocks: "++show (lsmFreeBlocks lsm)
 	putStrLn $ "resulting block counts: "++show (lsmBlockCounts lsm)
 	return (lsm, newLevel, rem)
@@ -701,7 +715,7 @@ mergeProcess lsm memPart@(memCnt, memKS, memDS, memMap) newLevels oldLevels = do
 				writers
 			putStrLn $ "Finalized writers:"
 			forM_ finalWriters $ putStrLn . ("    writer: "++) . show
-			let	runs = map writerToRun finalWriters
+			let	runs = reverse $ map writerToRun finalWriters
 				kdWriter = last finalWriters
 				level = makeLevel runs kdWriter
 			return (level, lsm)
@@ -749,6 +763,8 @@ mergeProcess lsm memPart@(memCnt, memKS, memDS, memMap) newLevels oldLevels = do
 			| overflow && pagesRemain > 0 = do
 				if bufPages >= pagesRemain
 					then do
+						putStrLn $ "writer page start: "++show (writerPageStart writer)
+						putStrLn $ "writer: "++show writer
 						lsmPutBuilderAtLogicalPage lsm (writerPageStart writer) pagesRemain (wrBuffer writer)
 						let	wr = writer {
 								  wrAbsPageIndex = pagesRemain + wrAbsPageIndex writer
@@ -773,6 +789,7 @@ mergeProcess lsm memPart@(memCnt, memKS, memDS, memMap) newLevels oldLevels = do
 				writeIndexSeq mbValue wr = do
 					let	value = Maybe.fromMaybe (internal "nothing for index seq?") mbValue
 						add = mconcat [encodeLength 0 0 keyLen, encodeLength 0 0 (fromIntegral $ BS.length value), lazyByteString key, lazyByteString value]
+					putStrLn $ "index add: "++show add
 					return $ wr {
 						  wrBuffer = mappend (wrBuffer wr) add
 						}
@@ -793,16 +810,32 @@ mergeProcess lsm memPart@(memCnt, memKS, memDS, memMap) newLevels oldLevels = do
 						, wrDataSize = dataLen + wrDataSize wr
 						}
 				go indexWr mbValue wr [] = do
+					putStrLn $ "go:"
+					putStrLn $ "    indexWr: "++show indexWr
+					putStrLn $ "    mbValue: "++show mbValue
+					putStrLn $ "    wr: "++show wr
+					putStrLn $ "    (iwr:iwrs): []"
 					wr' <- (if indexWr then writeIndexSeq else writeKeyDataSeq)
 						mbValue wr
 					return [wr']
 				go indexWr mbValue wr (iwr:iwrs) = do
-					putStrLn $ "go: "++show (indexWr, mbValue, wr, (iwr:iwrs))
+					putStrLn $ "go:"
+					putStrLn $ "    indexWr: "++show indexWr
+					putStrLn $ "    mbValue: "++show mbValue
+					putStrLn $ "    wr: "++show wr
+					putStrLn $ "    (iwr:iwrs): "++show (iwr:iwrs)
 					let	nextData = Just $ encodePos wr
-					wrs <- go True nextData iwr iwrs
-					wr <- if indexWr
+					wrs <- if wrKeysWrittenModBranch wr == 0
+							then go True nextData iwr iwrs
+							else return (iwr:iwrs)
+					wr' <- if indexWr
 						then writeIndexSeq mbValue wr
 						else writeKeyDataSeq mbValue wr
+					let	kwmb' = wrKeysWrittenModBranch wr' + 1
+						kwmb = if kwmb' >= lsmBranching lsm then kwmb' - lsmBranching lsm else kwmb'
+						wr = wr' {
+						  wrKeysWrittenModBranch	= kwmb
+						}
 					return $ wr : wrs
 		encodePos wr = toLazyByteString $
 			mconcat $ map encodeWideInt [wrAbsPageIndex wr, fromIntegral $ builderLength $ wrBuffer wr]
@@ -848,13 +881,14 @@ mergeProcess lsm memPart@(memCnt, memKS, memDS, memMap) newLevels oldLevels = do
 			where
 				allocPagesCount = div (inPages allDataSize + 7) 8
 				writer = Writer {
-					  wrAllocPagesCount	= allocPagesCount
-					, wrAbsPageIndex	= 0
-					, wrKeysWritten		= 0
-					, wrKeysSize		= 0
-					, wrDataSize		= 0
-					, wrBlocks		= []
-					, wrBuffer		= mempty
+					  wrAllocPagesCount		= allocPagesCount
+					, wrAbsPageIndex		= 0
+					, wrKeysWritten			= 0
+					, wrKeysWrittenModBranch	= 0
+					, wrKeysSize			= 0
+					, wrDataSize			= 0
+					, wrBlocks			= []
+					, wrBuffer			= mempty
 					}
 				cntUp = up cnt
 				allDataSizeUp = up allDataSize
@@ -918,6 +952,7 @@ replaceOldestState lsm levels = do
 	putStrLn $ "Oldest state: "++show oldest
 	putStrLn $ "new state: "++show new
 	writeState True lsm new
+	putStrLn $ "resulting states: "++show (lsmiStates $ lsmInfo result)
 	return result
 	where
 		result = lsm {
@@ -976,8 +1011,11 @@ internalReadIter lsm iter
 		builderBuf = diBuffer iter
 		readDataIn pagesNeeded lsm iter = do
 			putStrLn $ "reading data for iter "++show iter
+			putStrLn $ "                      buffer before: "++show (diBuffer iter)
 			let	LSMBlock addr size = diskIterCurrentLogicalPageBlock iter
 				count = min size pagesNeeded
+			putStrLn $ "                      reading from addr: "++show addr
+			putStrLn $ "                              count: "++show count
 			pages' <- readLogicalPages lsm addr count
 			let	ofs = diPageOffset iter
 				pages = if ofs > 0 then BS.drop (fromIntegral ofs) pages' else pages'
@@ -986,6 +1024,7 @@ internalReadIter lsm iter
 					, diPageOffset = 0
 					, diPageIndex = diPageIndex iter + count
 					}
+			putStrLn $ "                      buffer after: "++show (diBuffer iter')
 			return iter'
 		parsePair buf
 			-- too small even for key length.
@@ -1028,7 +1067,8 @@ internalReadIter lsm iter
 				| otherwise -> do
 					iter' <- readDataIn (max pagesNeed $ diPagesPreread iter) lsm iter
 					readPairs iter'
-			Right (kvs, buf') -> return iter { diBuffer = buf', diKVs = kvs }
+			Right (kvs, buf') -> do
+				return iter { diBuffer = buf', diKVs = kvs }
 			where
 				buf = diBuffer iter
 
@@ -1192,6 +1232,7 @@ newLSMWithConfig pageBits statesCount forceCreate path
 				writeStates lsm	-- this syncs. ;)
 				return lsm
 			else readHeaderInfo lsm
+	putStrLn $ "Worker will be spawn with info "++show (lsmInfo lsm)
 	forkIO $ lsmWorker lsm
 	return $ lsmCmdChan lsm
 

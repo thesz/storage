@@ -69,6 +69,8 @@ testWriteUpTo16KCommitCloseOpenReadRollback = do
 		test n = do
 			putStrLn $ "testing portion of size "++show n
 			lsm <- newLSM True file
+			putStrLn $ "Created."
+			--getLine
 			tx <- lsmBegin ReadCommitted lsm
 			forM_ [1..n] $ \i -> do
 				let	k = mkBS $ show i
@@ -76,7 +78,10 @@ testWriteUpTo16KCommitCloseOpenReadRollback = do
 				lsmWrite tx k v
 			lsmCommit tx
 			lsmClose lsm
+			putStrLn $ "Wrote "++show n
+			--getLine
 			lsm <- newLSM False file
+			putStrLn "Reopened."
 			tx <- lsmBegin ReadCommitted lsm
 			forM_ [1..n] $ \i -> do
 				let	k = mkBS $ show i

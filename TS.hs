@@ -27,7 +27,7 @@ testWriteReadRollback = do
 		v = mkBS "b"
 	lsmWrite tx k v
 	v' <- lsmRead tx k
-	when (v' /= Just v) $ error $ "expected " ++ show (Just v) ++", got "++show v'
+	when (v' /= Just v) $ error $ "expected " ++ show (Just v) ++", got "++show v'++"for key "++show k
 	lsmRollback tx
 	lsmClose lsm
 	done
@@ -87,7 +87,7 @@ testWriteUpTo16KCommitCloseOpenReadRollback = do
 				let	k = mkBS $ show i
 					v = mkBS $ show (i+n)
 				v' <- lsmRead tx k
-				when (v' /= Just v) $ error $ "expected " ++ show (Just v) ++", got "++show v'
+				when (v' /= Just v) $ error $ "expected " ++ show (Just v) ++", got "++show v'++" for key "++show k
 			lsmRollback tx
 			lsmClose lsm
 

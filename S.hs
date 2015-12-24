@@ -838,7 +838,13 @@ mergeProcess lsm memPart@(memCnt, memKS, memDS, memMap) newLevels oldLevels = do
 						}
 					return $ wr : wrs
 		encodePos wr = toLazyByteString $
-			mconcat $ map encodeWideInt [wrAbsPageIndex wr, fromIntegral $ builderLength $ wrBuffer wr]
+			mconcat $ map encodeWideInt [absIndex + bufPages, ofsInPage ]
+			where
+				absIndex = wrAbsPageIndex wr
+				bufSize = fromIntegral $ builderLength $ wrBuffer wr
+				bufPages = shiftR bufSize shift
+				shift = lsmhPageShift $ lsmiHeader $ lsmInfo lsm
+				ofsInPage = bufSize .&. (shiftL 1 shift - 1)
 		putIter n iter prioQ = do
 			readResult <- readIterValue lsm iter
 			case readResult of
@@ -1133,11 +1139,13 @@ readInLevels chan key (level:levels) = do
 		readInLevel page offset [keyDataRun] = do
 			diskIter <- startIterator chan page offset hasDels True keyDataRun
 			(mbValue, diskIter) <- navigateIterForKey False chan key diskIter
+			putStrLn $ "navigation in keyData run: "++show mbValue
 			internalReleaseBlocks chan $ lsmrBlocks keyDataRun
 			return $ Maybe.fromMaybe Nothing mbValue
 		readInLevel page offset (keyPageOfsRun:kpors) = do
 			diskIter <- startIterator chan page offset False False keyPageOfsRun
 			(mbValue, diskIter) <- navigateIterForKey True chan key diskIter
+			putStrLn $ "navigation in pointers run: "++show mbValue
 			internalReleaseBlocks chan $ lsmrBlocks keyPageOfsRun
 			case mbValue of
 				Just (Just pos) -> do

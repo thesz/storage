@@ -47,11 +47,19 @@ unsupported msg = error $ "unsupported: "++msg
 internal msg = error $ "internal error: "++msg
 ned msg = error $ "not yet done: "++msg
 
+debugMode :: Bool
+debugMode = False
+
+debugPutStrLn :: String -> IO ()
+debugPutStrLn
+	| debugMode = putStrLn
+	| otherwise = const $ return ()
+
 -------------------------------------------------------------------------------
 -- Constants.
 
 defaultPageBits :: Int
-defaultPageBits = 7
+defaultPageBits = 13
 
 defaultMemoryPartSize :: WideInt
 defaultMemoryPartSize = 256*1024
@@ -63,10 +71,10 @@ minSizeIncrement :: WideInt
 minSizeIncrement = defaultMemoryPartSize*2
 
 defaultBranchingFactor :: WideInt
-defaultBranchingFactor = 8
+defaultBranchingFactor = 1024
 
 defaultCommitRecordSize :: WideInt
-defaultCommitRecordSize = 1024
+defaultCommitRecordSize = 32*1024
 
 -------------------------------------------------------------------------------
 -- Data types.
@@ -386,7 +394,7 @@ mkLSM info chan handle filePages = let lsm = LSM {
 
 lsmPutBuilderAtPhysPage :: LSM -> WideInt -> WideInt -> Builder -> IO Builder
 lsmPutBuilderAtPhysPage lsm physPages pagesCount bb@(Builder bl b) = do
-	putStrLn $ "writing "++show (toLazyByteString bb)++" at "++printf "%08x" pos
+	debugPutStrLn $ "writing "++show (toLazyByteString bb)++" at "++printf "%08x" pos
 	hSeek (lsmHandle lsm) AbsoluteSeek $ fromIntegral pos
 	BS.hPut (lsmHandle lsm) toWrite
 	return rest
@@ -423,7 +431,7 @@ readHeaderInfo lsm = do
 	when (lsmhStateRecSize hdr > 128*1024) $ internal $ "state record size "++show (lsmhStateRecSize hdr)++" is too big."
 	when (lsmhStateRecSize hdr < 1024) $ internal $ "state record size "++show (lsmhStateRecSize hdr)++" is too small."
 	states <- foldM (\states i -> readState lsm' i >>= \s -> return (states ++[s])) [] [0..lsmhStatesCount hdr - 1]
-	putStrLn $ "LSM states read: "++show states
+	debugPutStrLn $ "LSM states read: "++show states
 	return $ lsm' { lsmInfo = (lsmInfo lsm') { lsmiStates = states } }
 	where
 		readState lsm i = do
@@ -484,10 +492,10 @@ readPhysicalPages lsm addr npages = do
 
 writeState :: Bool -> LSM -> LSMState -> IO ()
 writeState flush lsm state = do
-	putStrLn $ "Writing state "++show state
-	putStrLn $ "         page "++show page
-	putStrLn $ "        pages "++show pages
-	putStrLn $ "      content "++show (toLazyByteString enc)
+	debugPutStrLn $ "Writing state "++show state
+	debugPutStrLn $ "         page "++show page
+	debugPutStrLn $ "        pages "++show pages
+	debugPutStrLn $ "      content "++show (toLazyByteString enc)
 	lsmPutBuilderAtPhysPage lsm page pages enc
 	when flush $ hFlush $ lsmHandle lsm
 	where
@@ -686,19 +694,19 @@ writerPageStart wr = find absPage (wrBlocks wr)
 
 mergeProcess :: LSM -> (WideInt, WideInt, WideInt, Map.Map BS.ByteString (Maybe BS.ByteString)) -> [LSMLevel] -> [LSMLevel] -> IO (LSM, LSMLevel, [LSMLevel])
 mergeProcess lsm memPart@(memCnt, memKS, memDS, memMap) newLevels oldLevels = do
-	putStrLn $ "mergeProcess:     mem: "++show memPart
-	putStrLn $ "                  new: "++show newLevels
-	putStrLn $ "                  old: "++show newLevels
-	putStrLn $ "                merge: "++show resultIters
-	putStrLn $ "                  rem: "++show rem
-	putStrLn $ "     merge no deletes: "++show mergeNoDeletes
-	putStrLn $ "              writers: "++show writers
-	putStrLn $ "starting priority queue."
+	debugPutStrLn $ "mergeProcess:     mem: "++show memPart
+	debugPutStrLn $ "                  new: "++show newLevels
+	debugPutStrLn $ "                  old: "++show newLevels
+	debugPutStrLn $ "                merge: "++show resultIters
+	debugPutStrLn $ "                  rem: "++show rem
+	debugPutStrLn $ "     merge no deletes: "++show mergeNoDeletes
+	debugPutStrLn $ "              writers: "++show writers
+	debugPutStrLn $ "starting priority queue."
 	prioQ <- foldM readFirstValue Map.empty resultIters
 	(newLevel, lsm) <- merge lsm writers prioQ
-	putStrLn $ "newLevel: "++show newLevel
-	putStrLn $ "resulting free blocks: "++show (lsmFreeBlocks lsm)
-	putStrLn $ "resulting block counts: "++show (lsmBlockCounts lsm)
+	debugPutStrLn $ "newLevel: "++show newLevel
+	debugPutStrLn $ "resulting free blocks: "++show (lsmFreeBlocks lsm)
+	debugPutStrLn $ "resulting block counts: "++show (lsmBlockCounts lsm)
 	return (lsm, newLevel, rem)
 	where
 		merge lsm writers prioQ = case Map.minViewWithKey prioQ of
@@ -710,11 +718,11 @@ mergeProcess lsm memPart@(memCnt, memKS, memDS, memMap) newLevels oldLevels = do
 				merge lsm' writers' prioQ'
 			Nothing -> finalizeMerge lsm writers
 		finalizeMerge lsm writers = do
-			putStrLn "Finalizing merge."
+			debugPutStrLn "Finalizing merge."
 			(finalWriters, lsm) <- foldM (\(ws, lsm) wr -> finalizeWriter wr lsm >>= \(wr, lsm) -> return (ws++wr, lsm)) ([], lsm)
 				writers
-			putStrLn $ "Finalized writers:"
-			forM_ finalWriters $ putStrLn . ("    writer: "++) . show
+			debugPutStrLn $ "Finalized writers:"
+			forM_ finalWriters $ debugPutStrLn . ("    writer: "++) . show
 			let	runs = reverse $ map writerToRun finalWriters
 				kdWriter = last finalWriters
 				level = makeLevel runs kdWriter
@@ -722,7 +730,7 @@ mergeProcess lsm memPart@(memCnt, memKS, memDS, memMap) newLevels oldLevels = do
 		finalizeWriter wr' lsm = do
 			let	wr = wr' { wrBuffer = mappend (wrBuffer wr') (writeByte 0) }	-- sequential runs are like these. end with key len 0.
 				(lsm', wr'') = allocateForWrite True wr' lsm
-			putStrLn $ "Finalized writer "++show wr++"\n     wr'': "++show wr''
+			debugPutStrLn $ "Finalized writer "++show wr++"\n     wr'': "++show wr''
 			(lsm'', wr''') <- actualWriterFlush True lsm' wr''
 			return ([wr'''], lsm')
 		allocateForWrite lastBlock writer lsm
@@ -751,7 +759,7 @@ mergeProcess lsm memPart@(memCnt, memKS, memDS, memMap) newLevels oldLevels = do
 				pagesNeedToBeWritten = lsmBytesPages lsm bytesNeedToBeWritten
 		flushWriter :: Bool -> (LSM, [Writer]) -> Writer -> IO (LSM, [Writer])
 		flushWriter final (lsm, ws) writer = do
-			putStrLn $ "flushing "++show (final, writer)
+			debugPutStrLn $ "flushing "++show (final, writer)
 			(lsm', writer') <- if flush
 				then actualWriterFlush final lsm writer
 				else return (lsm, writer)
@@ -763,8 +771,8 @@ mergeProcess lsm memPart@(memCnt, memKS, memDS, memMap) newLevels oldLevels = do
 			| overflow && pagesRemain > 0 = do
 				if bufPages >= pagesRemain
 					then do
-						putStrLn $ "writer page start: "++show (writerPageStart writer)
-						putStrLn $ "writer: "++show writer
+						debugPutStrLn $ "writer page start: "++show (writerPageStart writer)
+						debugPutStrLn $ "writer: "++show writer
 						lsmPutBuilderAtLogicalPage lsm (writerPageStart writer) pagesRemain (wrBuffer writer)
 						let	wr = writer {
 								  wrAbsPageIndex = pagesRemain + wrAbsPageIndex writer
@@ -789,7 +797,7 @@ mergeProcess lsm memPart@(memCnt, memKS, memDS, memMap) newLevels oldLevels = do
 				writeIndexSeq mbValue wr = do
 					let	value = Maybe.fromMaybe (internal "nothing for index seq?") mbValue
 						add = mconcat [encodeLength 0 0 keyLen, encodeLength 0 0 (fromIntegral $ BS.length value), lazyByteString key, lazyByteString value]
-					putStrLn $ "index add: "++show add
+					debugPutStrLn $ "index add: "++show add
 					return $ wr {
 						  wrBuffer = mappend (wrBuffer wr) add
 						}
@@ -810,20 +818,20 @@ mergeProcess lsm memPart@(memCnt, memKS, memDS, memMap) newLevels oldLevels = do
 						, wrDataSize = dataLen + wrDataSize wr
 						}
 				go indexWr mbValue wr [] = do
-					putStrLn $ "go:"
-					putStrLn $ "    indexWr: "++show indexWr
-					putStrLn $ "    mbValue: "++show mbValue
-					putStrLn $ "    wr: "++show wr
-					putStrLn $ "    (iwr:iwrs): []"
+					debugPutStrLn $ "go:"
+					debugPutStrLn $ "    indexWr: "++show indexWr
+					debugPutStrLn $ "    mbValue: "++show mbValue
+					debugPutStrLn $ "    wr: "++show wr
+					debugPutStrLn $ "    (iwr:iwrs): []"
 					wr' <- (if indexWr then writeIndexSeq else writeKeyDataSeq)
 						mbValue wr
 					return [wr']
 				go indexWr mbValue wr (iwr:iwrs) = do
-					putStrLn $ "go:"
-					putStrLn $ "    indexWr: "++show indexWr
-					putStrLn $ "    mbValue: "++show mbValue
-					putStrLn $ "    wr: "++show wr
-					putStrLn $ "    (iwr:iwrs): "++show (iwr:iwrs)
+					debugPutStrLn $ "go:"
+					debugPutStrLn $ "    indexWr: "++show indexWr
+					debugPutStrLn $ "    mbValue: "++show mbValue
+					debugPutStrLn $ "    wr: "++show wr
+					debugPutStrLn $ "    (iwr:iwrs): "++show (iwr:iwrs)
 					let	nextData = Just $ encodePos wr
 					wrs <- if wrKeysWrittenModBranch wr == 0
 							then go True nextData iwr iwrs
@@ -867,9 +875,9 @@ mergeProcess lsm memPart@(memCnt, memKS, memDS, memMap) newLevels oldLevels = do
 		mergeNoDeletes = null rem
 		readFirstValue map (n,iter) = do
 			val <- readIterValue lsm iter
-			putStrLn $ "first value. iter: "++show iter
-			putStrLn $ "                n: "++show n
-			putStrLn $ "              val: "++show val
+			debugPutStrLn $ "first value. iter: "++show iter
+			debugPutStrLn $ "                n: "++show n
+			debugPutStrLn $ "              val: "++show val
 			case val of
 				Nothing -> return map
 				Just ((key, mbVal), iter')
@@ -955,10 +963,10 @@ mergeFree a@(lb1:lb1s) b@(lb2:lb2s)
 
 replaceOldestState :: LSM -> [LSMLevel] -> IO LSM
 replaceOldestState lsm levels = do
-	putStrLn $ "Oldest state: "++show oldest
-	putStrLn $ "new state: "++show new
+	debugPutStrLn $ "Oldest state: "++show oldest
+	debugPutStrLn $ "new state: "++show new
 	writeState True lsm new
-	putStrLn $ "resulting states: "++show (lsmiStates $ lsmInfo result)
+	debugPutStrLn $ "resulting states: "++show (lsmiStates $ lsmInfo result)
 	return result
 	where
 		result = lsm {
@@ -1016,12 +1024,12 @@ internalReadIter lsm iter
 		blocks = diBlocks iter
 		builderBuf = diBuffer iter
 		readDataIn pagesNeeded lsm iter = do
-			putStrLn $ "reading data for iter "++show iter
-			putStrLn $ "                      buffer before: "++show (diBuffer iter)
+			debugPutStrLn $ "reading data for iter "++show iter
+			debugPutStrLn $ "                      buffer before: "++show (diBuffer iter)
 			let	LSMBlock addr size = diskIterCurrentLogicalPageBlock iter
 				count = min size pagesNeeded
-			putStrLn $ "                      reading from addr: "++show addr
-			putStrLn $ "                              count: "++show count
+			debugPutStrLn $ "                      reading from addr: "++show addr
+			debugPutStrLn $ "                              count: "++show count
 			pages' <- readLogicalPages lsm addr count
 			let	ofs = diPageOffset iter
 				pages = if ofs > 0 then BS.drop (fromIntegral ofs) pages' else pages'
@@ -1030,7 +1038,7 @@ internalReadIter lsm iter
 					, diPageOffset = 0
 					, diPageIndex = diPageIndex iter + count
 					}
-			putStrLn $ "                      buffer after: "++show (diBuffer iter')
+			debugPutStrLn $ "                      buffer after: "++show (diBuffer iter')
 			return iter'
 		parsePair buf
 			-- too small even for key length.
@@ -1139,18 +1147,18 @@ readInLevels chan key (level:levels) = do
 		readInLevel page offset [keyDataRun] = do
 			diskIter <- startIterator chan page offset hasDels True keyDataRun
 			(mbValue, diskIter) <- navigateIterForKey False chan key diskIter
-			putStrLn $ "navigation in keyData run: "++show mbValue
+			debugPutStrLn $ "navigation in keyData run: "++show mbValue
 			internalReleaseBlocks chan $ lsmrBlocks keyDataRun
 			return $ Maybe.fromMaybe Nothing mbValue
 		readInLevel page offset (keyPageOfsRun:kpors) = do
 			diskIter <- startIterator chan page offset False False keyPageOfsRun
 			(mbValue, diskIter) <- navigateIterForKey True chan key diskIter
-			putStrLn $ "navigation in pointers run: "++show mbValue
+			debugPutStrLn $ "navigation in pointers run: "++show mbValue
 			internalReleaseBlocks chan $ lsmrBlocks keyPageOfsRun
 			case mbValue of
 				Just (Just pos) -> do
 					let	(page, ofs) = evalState (liftM2 (,) decodeWideIntM decodeWideIntM) pos
-					putStrLn $ "Read position: "++show (pos, (page, ofs))
+					debugPutStrLn $ "Read position: "++show (pos, (page, ofs))
 					readInLevel page ofs kpors
 				Nothing -> return Nothing
 
@@ -1164,8 +1172,8 @@ lsmWorker lsm = do
 		CopyLevels result -> do
 			let	levelsToCopy = findRecentLevels lsm
 				lsm' = acquireReleaseLevels lsm levelsToCopy []
-			putStrLn $ "levelsToCopy "++show levelsToCopy
-			putStrLn $ "lsmInfo "++show (lsmInfo lsm)
+			debugPutStrLn $ "levelsToCopy "++show levelsToCopy
+			debugPutStrLn $ "lsmInfo "++show (lsmInfo lsm)
 			putMVar result levelsToCopy
 			lsmWorker lsm'
 		Release blocks -> do
@@ -1240,7 +1248,7 @@ newLSMWithConfig pageBits statesCount forceCreate path
 				writeStates lsm	-- this syncs. ;)
 				return lsm
 			else readHeaderInfo lsm
-	putStrLn $ "Worker will be spawn with info "++show (lsmInfo lsm)
+	debugPutStrLn $ "Worker will be spawn with info "++show (lsmInfo lsm)
 	forkIO $ lsmWorker lsm
 	return $ lsmCmdChan lsm
 
@@ -1340,9 +1348,9 @@ lsmRead txn key = withTxn "lsmRead" txn $ \txni -> do
 			case (mbVal, lsmtiIsolation txni) of
 				(Nothing, SnapshotIsolation) -> return Nothing
 				(Nothing, ReadCommitted) -> do
-					putStrLn $ "Local txn levels "++show (lsmtiLevels txni)
+					debugPutStrLn $ "Local txn levels "++show (lsmtiLevels txni)
 					levels <- internalCopyLevels chan
-					putStrLn $ "Levels to read from "++show (levels)
+					debugPutStrLn $ "Levels to read from "++show (levels)
 					mbVal <- readInLevels chan key levels
 					internalReleaseLevels chan levels
 					return mbVal

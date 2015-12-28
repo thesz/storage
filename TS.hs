@@ -6,6 +6,8 @@ import Control.Monad
 
 import qualified Data.ByteString.Lazy as BS
 
+import Data.Time.Clock
+
 import S
 
 file = "aaa.lsm"
@@ -14,6 +16,13 @@ mkBS :: String -> BS.ByteString
 mkBS = BS.pack . map (fromIntegral . fromEnum)
 
 done = putStrLn "DONE"
+
+runtime name act = do
+	start <- getCurrentTime
+	x <- act
+	end <- getCurrentTime
+	putStrLn $ show name++" done in "++show (diffUTCTime end start)
+	return x
 
 testNewClose = do
 	lsm <- newLSM True file
@@ -67,29 +76,31 @@ testWriteUpTo16KCommitCloseOpenReadRollback = do
 	done
 	where
 		test n = do
-			putStrLn $ "testing portion of size "++show n
-			lsm <- newLSM True file
-			putStrLn $ "Created."
-			--getLine
-			tx <- lsmBegin ReadCommitted lsm
-			forM_ [1..n] $ \i -> do
-				let	k = mkBS $ show i
-					v = mkBS $ show (i+n)
-				lsmWrite tx k v
-			lsmCommit tx
-			lsmClose lsm
-			putStrLn $ "Wrote "++show n
-			--getLine
-			lsm <- newLSM False file
-			putStrLn "Reopened."
-			tx <- lsmBegin ReadCommitted lsm
-			forM_ [1..n] $ \i -> do
-				let	k = mkBS $ show i
-					v = mkBS $ show (i+n)
-				v' <- lsmRead tx k
-				when (v' /= Just v) $ error $ "expected " ++ show (Just v) ++", got "++show v'++" for key "++show k
-			lsmRollback tx
-			lsmClose lsm
+			runtime ("wrote "++show n) $ do
+				putStrLn $ "testing portion of size "++show n
+				lsm <- newLSM True file
+				putStrLn $ "Created."
+				--getLine
+				tx <- lsmBegin ReadCommitted lsm
+				forM_ [1..n] $ \i -> do
+					let	k = mkBS $ show i
+						v = mkBS $ show (i+n)
+					lsmWrite tx k v
+				lsmCommit tx
+				lsmClose lsm
+				putStrLn $ "Wrote "++show n
+			runtime ("read back "++show n) $ do
+				--getLine
+				lsm <- newLSM False file
+				putStrLn "Reopened."
+				tx <- lsmBegin ReadCommitted lsm
+				forM_ [1..n] $ \i -> do
+					let	k = mkBS $ show i
+						v = mkBS $ show (i+n)
+					v' <- lsmRead tx k
+					when (v' /= Just v) $ error $ "expected " ++ show (Just v) ++", got "++show v'++" for key "++show k
+				lsmRollback tx
+				lsmClose lsm
 
 
 main = do

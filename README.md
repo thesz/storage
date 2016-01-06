@@ -16,8 +16,15 @@ Copyright information
 Copyright (C) 2015 Serguey Zefirov
 
 
+Documentation
+-------------
+
+A preliminary version can be found [here](https://docs.google.com/document/d/1EYS100swps1V9PVnnVdY2qHkF1u4zRooqH4w76jbsEk/pub).
+
+
 Source files
 -----
 
 S.hs - storage engine,
 TS.hs - tests.
+

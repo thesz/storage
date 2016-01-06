@@ -172,6 +172,7 @@ data LSMLevel = LSMLevel {
 	  lsmlPairsCount	:: WideInt
 	, lsmlKeysSize		:: WideInt
 	, lsmlDataSize		:: WideInt
+	, lsmlHasDeletes	:: Bool
 	, lsmlRuns		:: [LSMRun]
 	}
 	deriving (Eq, Ord, Show)
@@ -341,6 +342,11 @@ decodeListM decoder = do
 	n <- decodeWideIntM
 	liftM reverse $ foldM (\list _ -> decoder >>= \x -> return (x:list)) [] [1..n]
 
+decodeListMapM :: (a -> DecodeM b) -> [a] -> DecodeM [b]
+decodeListMapM decoder list = do
+	n <- decodeWideIntM
+	liftM reverse $ foldM (\list a -> decoder a >>= \x -> return (x:list)) [] $ zipWith const list [1..n]
+
 decodeLSMRunTypeM :: DecodeM LSMRunType
 decodeLSMRunTypeM = do
 	s <- get
@@ -440,7 +446,7 @@ readHeaderInfo lsm = do
 					runTy <- decodeLSMRunTypeM
 					blocks <- decodeListM $ liftM2 LSMBlock decodeWideIntM decodeWideIntM
 					return $ LSMRun runTy blocks
-				level = do
+				level withDeletes = do
 					pairsCount <- decodeWideIntM
 					keysSize <- decodeWideIntM
 					dataSize <- decodeWideIntM
@@ -449,11 +455,12 @@ readHeaderInfo lsm = do
 						  lsmlPairsCount	= pairsCount
 						, lsmlKeysSize		= keysSize
 						, lsmlDataSize		= dataSize
+						, lsmlHasDeletes	= withDeletes
 						, lsmlRuns		= runs
 						}
 				state = flip evalState statePages $ do
 					seqIndex <- decodeWideIntM
-					levels <- decodeListM level
+					levels <- decodeListMapM level (error "AAAAAAAAA!!!!!!!!!")
 					return $ LSMState {
 						  lsmsPhysIndex		= i
 						, lsmsSeqIndex		= seqIndex
@@ -654,12 +661,13 @@ writerToRun wr = LSMRun {
 	, lsmrBlocks	= wrBlocks wr
 	}
 
-makeLevel :: [LSMRun] -> Writer -> LSMLevel
-makeLevel runs kdWriter = LSMLevel {
+makeLevel :: [LSMRun] -> Bool -> Writer -> LSMLevel
+makeLevel runs deletes kdWriter = LSMLevel {
 	  lsmlRuns		= runs
 	, lsmlPairsCount	= wrKeysWritten kdWriter
 	, lsmlKeysSize		= wrKeysSize kdWriter
 	, lsmlDataSize		= wrDataSize kdWriter
+	, lsmlHasDeletes	= deletes
 	}
 
 allocateBlock :: WideInt -> LSM -> (LSM, LSMBlock)
@@ -692,8 +700,8 @@ writerPageStart wr = find absPage (wrBlocks wr)
 			| index < lsmbSize b = lsmbAddr b + index
 			| otherwise = find (index - lsmbSize b) bs
 
-mergeProcess :: LSM -> (WideInt, WideInt, WideInt, Map.Map BS.ByteString (Maybe BS.ByteString)) -> [LSMLevel] -> [LSMLevel] -> IO (LSM, LSMLevel, [LSMLevel])
-mergeProcess lsm memPart@(memCnt, memKS, memDS, memMap) newLevels oldLevels = do
+mergeProcess :: LSM -> Bool -> (WideInt, WideInt, WideInt, Map.Map BS.ByteString (Maybe BS.ByteString)) -> [LSMLevel] -> [LSMLevel] -> IO (LSM, LSMLevel, [LSMLevel])
+mergeProcess lsm leaveDeletes memPart@(memCnt, memKS, memDS, memMap) newLevels oldLevels = do
 	debugPutStrLn $ "mergeProcess:     mem: "++show memPart
 	debugPutStrLn $ "                  new: "++show newLevels
 	debugPutStrLn $ "                  old: "++show newLevels
@@ -725,7 +733,7 @@ mergeProcess lsm memPart@(memCnt, memKS, memDS, memMap) newLevels oldLevels = do
 			forM_ finalWriters $ debugPutStrLn . ("    writer: "++) . show
 			let	runs = reverse $ map writerToRun finalWriters
 				kdWriter = last finalWriters
-				level = makeLevel runs kdWriter
+				level = makeLevel runs (not mergeNoDeletes) kdWriter
 			return (level, lsm)
 		finalizeWriter wr' lsm = do
 			let	wr = wr' { wrBuffer = mappend (wrBuffer wr') (writeByte 0) }	-- sequential runs are like these. end with key len 0.
@@ -1202,7 +1210,7 @@ lsmWorker lsm = do
 					| memCounts == 0 && null levels -> return lsm
 					-- merge levels and/or mem.
 					| otherwise -> do
-						(lsm', mergedLevel, remainingLevels) <- mergeProcess lsm (memCounts, memKeysSize, memDataSize, memoryPart) levels recentLevels
+						(lsm', mergedLevel, remainingLevels) <- mergeProcess lsm False (memCounts, memKeysSize, memDataSize, memoryPart) levels recentLevels
 						let	lsm'' = acquireReleaseLevels lsm' (mergedLevel:remainingLevels) (levels ++ recentLevels)
 						replaceOldestState lsm' (mergedLevel : remainingLevels)
 				SnapshotIsolation

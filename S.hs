@@ -446,7 +446,7 @@ readHeaderInfo lsm = do
 					runTy <- decodeLSMRunTypeM
 					blocks <- decodeListM $ liftM2 LSMBlock decodeWideIntM decodeWideIntM
 					return $ LSMRun runTy blocks
-				level withDeletes = do
+				level = do
 					pairsCount <- decodeWideIntM
 					keysSize <- decodeWideIntM
 					dataSize <- decodeWideIntM
@@ -455,12 +455,16 @@ readHeaderInfo lsm = do
 						  lsmlPairsCount	= pairsCount
 						, lsmlKeysSize		= keysSize
 						, lsmlDataSize		= dataSize
-						, lsmlHasDeletes	= withDeletes
+						, lsmlHasDeletes	= False
 						, lsmlRuns		= runs
 						}
 				state = flip evalState statePages $ do
 					seqIndex <- decodeWideIntM
-					levels <- decodeListMapM level (error "AAAAAAAAA!!!!!!!!!")
+					let	setDelete delFlag level = level { lsmlHasDeletes = delFlag }
+						addDeletes list = zipWith setDelete
+							(tail $ map (const True) list ++ repeat False)
+							list
+					levels <- decodeListM level
 					return $ LSMState {
 						  lsmsPhysIndex		= i
 						, lsmsSeqIndex		= seqIndex

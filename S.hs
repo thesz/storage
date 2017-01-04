@@ -607,7 +607,7 @@ data Iter =
 findPageBlockAbs :: WideInt -> [LSMBlock] -> LSMBlock
 findPageBlockAbs pageIndex blocks = find pageIndex blocks
 	where
-		find _ [] = internal "pageIndex out of blocks range"
+		find _ [] = internal $ "pageIndex out of blocks range"++"\npage index: "++show pageIndex ++"\nblocks: "++show blocks
 		find i (b:bs)
 			| i < lsmbSize b = LSMBlock (lsmbAddr b + i) (lsmbSize b - i)
 			| otherwise = find (i-lsmbSize b) bs

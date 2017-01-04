@@ -1,0 +1,57 @@
+#!/usr/bin/tclsh
+#
+# An utility to read LSM files and display their technical content.
+# Slow as hell.
+
+proc fail {msg} {
+	puts $msg
+	exit 1
+}
+
+if {[llength $argv] != 1} {
+	fail "usage: readLSM LSMfile"
+}
+
+proc read_at_byte_ofs {h byte_ofs count} {
+	seek $h $byte_ofs start
+	binary scan [read $h $count] c* bytes
+	return $bytes
+}
+
+proc read_wide_int {bufvar} {
+	upvar $bufvar buf
+	set b0 [expr [lindex $buf 0] & 0xff]
+	set buf [lrange $buf 1 end]
+	if {$b0 < 236} { return $b0 }
+	if {$b0 < 244} {
+		set b1 [lindex $buf 0]
+		set buf [lrange $buf 1 end]
+		return [expr ($b0-236)+256+$b1+236]
+	}
+	if {$b0 == 244} {
+		set b1 [lindex $buf 0]
+		set b2 [lindex $buf 1]
+		set buf [lrange $buf 2 end]
+		return [expr 256*8+236+$b1*256+$b2]]
+	}
+	fail "byte '$b0'??"
+}
+
+set page_bits -1
+set version -1
+set states_count -1
+set states_rec_size -1
+proc read_header {h} {
+	set buf [read_at_byte_ofs $h 0 256]
+	set ::version [read_wide_int buf]
+	set ::page_bits [read_wide_int buf]
+	set ::states_count [read_wide_int buf]
+	set ::states_rec_size [read_wide_int buf]
+	puts "header: version $::version; page bits $::page_bits; num of states $::states_count; states record size $::states_rec_size"
+}
+
+set h [open [lindex $argv 0]]
+fconfigure $h -encoding binary -translation binary
+
+read_header $h
+

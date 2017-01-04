@@ -2,7 +2,7 @@ Storage engine, LSM-style
 =========================
 
 
-Generral information
+General information
 --------------------
 
 This repository contains storage engine that implements persistent key-value storage
@@ -13,7 +13,7 @@ in transaction commit will not change in future.
 Copyright information
 ---------------------
 
-Copyright (C) 2015 Serguey Zefirov
+Copyright (C) 2017 Serguey Zefirov
 
 
 Documentation

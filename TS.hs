@@ -72,7 +72,7 @@ testWriteCommitCloseOpenReadRollback = do
 	done
 
 testWriteUpTo16KCommitCloseOpenReadRollback = do
-	forM (takeWhile (<=16384) $ iterate (*2) 2) $ test
+	forM (takeWhile (<=256*1024) $ iterate (*2) 2) $ test
 	done
 	where
 		test n = do

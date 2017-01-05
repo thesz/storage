@@ -74,8 +74,10 @@ proc read_list {bytes reader} {
 	set elems {}
 	while {$count > 0} {
 		set elem [eval $reader buf]
+		lappend elems $elem
 		incr count -1
 	}
+	return $elems
 }
 
 proc read_block {buf} {

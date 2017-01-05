@@ -18,6 +18,13 @@ proc read_at_byte_ofs {h byte_ofs count} {
 	return $bytes
 }
 
+proc read_abs_pages {h page_index pages_count} {
+	return [read_at_byte_ofs $h [expr $page_index << $::page_bits] [expr $pages_count << $::page_bits]]
+}
+proc read_log_pages {h page_index pages_count} {
+	return [read_abs_pages $h [expr $page_index + $::page_index_after_states] $pages_count
+}
+
 proc read_wide_int {bufvar} {
 	upvar $bufvar buf
 	set b0 [expr [lindex $buf 0] & 0xff]
@@ -32,22 +39,85 @@ proc read_wide_int {bufvar} {
 		set b1 [lindex $buf 0]
 		set b2 [lindex $buf 1]
 		set buf [lrange $buf 2 end]
-		return [expr 256*8+236+$b1*256+$b2]]
+		return [expr 256*8+236+$b1*256+$b2]
 	}
 	fail "byte '$b0'??"
 }
 
 set page_bits -1
+set page_size -1
 set version -1
 set states_count -1
 set states_rec_size -1
+set page_index_after_states -1
 proc read_header {h} {
 	set buf [read_at_byte_ofs $h 0 256]
 	set ::version [read_wide_int buf]
 	set ::page_bits [read_wide_int buf]
 	set ::states_count [read_wide_int buf]
 	set ::states_rec_size [read_wide_int buf]
-	puts "header: version $::version; page bits $::page_bits; num of states $::states_count; states record size $::states_rec_size"
+	set ::page_size [expr 1 << $::page_bits]
+	puts "header: version $::version; page bits $::page_bits ($::page_size bytes); num of states $::states_count; states record size $::states_rec_size"
+	if {($::states_rec_size % $::page_size) != 0} {
+		fail "state record size ($::states_rec_size) is not divisible by page size ($::page_size)."
+	}
+	if {$::page_size < 32} {
+		fail "page size ($::page_size) is too small."
+	}
+	set ::page_index_after_states [expr $::states_count*$::states_rec_size/$::page_size+1]
+	puts "first logical page $::page_index_after_states."
+}
+
+proc read_list {bytes reader} {
+	upvar $bytes buf
+	set count [read_wide_int buf]
+	set elems {}
+	while {$count > 0} {
+		set elem [eval $reader buf]
+		incr count -1
+	}
+}
+
+proc read_block {buf} {
+	upvar $buf bytes
+	set addr [read_wide_int bytes]
+	set size [read_wide_int bytes]
+	return [dict create addr $addr size $size]
+}
+
+proc read_lsm_run {buf} {
+	upvar $buf bytes
+	set run_type [read_wide_int bytes]
+	set blocks [read_list bytes read_block]
+	return [dict create run_type $run_type blocks $blocks]
+}
+proc read_lsm_level {buf} {
+	upvar $buf bytes
+	set pairs_count [read_wide_int bytes]
+	set keys_size [read_wide_int bytes]
+	set data_size [read_wide_int bytes]
+	set runs [read_list bytes read_lsm_run]
+	return [dict create pairs_count $pairs_count keys_size $keys_size data_size $data_size runs $runs]
+}
+set states {}
+set states_by_seqid {}
+proc read_states {h} {
+	set min_seq_index -1
+	for {set i 0} {$i < $::states_count} {incr i} {
+		set bytes [read_abs_pages $h [expr ($i*$::states_rec_size / $::page_size)+1] [expr $::states_rec_size >> $::page_bits]]
+		set seq_index [read_wide_int bytes]
+		set levels [read_list bytes read_lsm_level]
+		if {$i == 0 || $seq_index < $min_seq_index} { set min_seq_index $seq_index }
+		lappend ::states [dict create seq_index $seq_index phys_index $i levels $levels]
+	}
+	puts "states: $::states"
+	while {[llength $::states_by_seqid] < [llength $::states]} {
+		set search_id [expr $min_seq_index + [llength $::states_by_seqid]]
+		foreach s $::states {
+			if {[dict get $s seq_index] == $search_id} break
+		}
+		lappend ::states_by_seqid $s
+	}
 }
 
 set h [open [lindex $argv 0]]
@@ -55,3 +125,4 @@ fconfigure $h -encoding binary -translation binary
 
 read_header $h
 
+read_states $h

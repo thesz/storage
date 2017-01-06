@@ -731,7 +731,9 @@ mergeProcess lsm leaveDeletes memPart@(memCnt, memKS, memDS, memMap) newLevels o
 			Nothing -> finalizeMerge lsm writers
 		finalizeMerge lsm writers = do
 			debugPutStrLn "Finalizing merge."
-			(finalWriters, lsm) <- foldM (\(ws, lsm) wr -> finalizeWriter wr lsm >>= \(wr, lsm) -> return (ws++wr, lsm)) ([], lsm)
+			(finalWriters, lsm) <- foldM
+				(\(ws, lsm) wr -> finalizeWriter wr lsm >>= \(wr, lsm) -> return (ws++wr, lsm))
+				([], lsm)
 				writers
 			debugPutStrLn $ "Finalized writers:"
 			forM_ finalWriters $ debugPutStrLn . ("    writer: "++) . show
@@ -739,8 +741,8 @@ mergeProcess lsm leaveDeletes memPart@(memCnt, memKS, memDS, memMap) newLevels o
 				kdWriter = last finalWriters
 				level = makeLevel runs (not mergeNoDeletes) kdWriter
 			return (level, lsm)
-		finalizeWriter wr' lsm = do
-			let	wr = wr' { wrBuffer = mappend (wrBuffer wr') (writeByte 0) }	-- sequential runs are like these. end with key len 0.
+		finalizeWriter wr lsm = do
+			let	wr' = wr { wrBuffer = mappend (wrBuffer wr) (writeByte 0) }	-- sequential runs are like these. end with key len 0.
 				(lsm', wr'') = allocateForWrite True wr' lsm
 			debugPutStrLn $ "Finalized writer "++show wr++"\n     wr'': "++show wr''
 			(lsm'', wr''') <- actualWriterFlush True lsm' wr''

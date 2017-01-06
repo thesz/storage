@@ -122,9 +122,15 @@ proc read_states {h} {
 	}
 }
 
+proc read_most_recent_data {h} {
+	
+}
+
 set h [open [lindex $argv 0]]
 fconfigure $h -encoding binary -translation binary
 
 read_header $h
 
 read_states $h
+
+read_most_recent_data $h
